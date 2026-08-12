@@ -42,6 +42,10 @@ export interface RevisionStoreObject {
 	propertySet?: PropertySet;
 	fileDataReference?: string;
 	fileExtension?: string;
+	/** Byte-for-byte object property data retained when semantic decoding fails. */
+	rawData?: Uint8Array;
+	fileOffset?: number;
+	diagnostic?: OneNoteFormatError;
 }
 
 export interface FileDataStoreObject {
@@ -53,6 +57,14 @@ export interface ObjectGraph {
 	revisions: RevisionManifest[];
 	objects: RevisionStoreObject[];
 	fileDataObjects: FileDataStoreObject[];
+	diagnostics: GraphDiagnostic[];
+}
+
+export interface GraphDiagnostic {
+	code: string;
+	message: string;
+	offset?: number;
+	rawData: Uint8Array;
 }
 
 export function keyOf(id: ExtendedGuid): string {
@@ -106,7 +118,7 @@ interface ListFrame {
 }
 
 class GraphReader {
-	readonly result: ObjectGraph = { revisions: [], objects: [], fileDataObjects: [] };
+	readonly result: ObjectGraph = { revisions: [], objects: [], fileDataObjects: [], diagnostics: [] };
 	private readonly visited = new Set<FileNodeList>();
 	private readonly knownRevisions = new Map<string, RevisionManifest>();
 	private readonly knownJcids = new Map<string, number>();
@@ -134,7 +146,18 @@ class GraphReader {
 			}
 
 			const node = frame.list.nodes[frame.nextNodeIndex++];
-			this.processNode(node, frame);
+			try {
+				this.processNode(node, frame);
+			}
+			catch (error) {
+				if (!(error instanceof OneNoteFormatError)) throw error;
+				this.result.diagnostics.push({
+					code: error.code,
+					message: error.message,
+					offset: error.offset ?? node.fileOffset,
+					rawData: this.rawNode(node),
+				});
+			}
 
 			if (node.referencedList && !this.visited.has(node.referencedList)) {
 				this.visited.add(node.referencedList);
@@ -148,6 +171,19 @@ class GraphReader {
 				});
 			}
 		}
+	}
+
+	private rawNode(node: FileNode): Uint8Array {
+		const reference = node.chunkReference;
+		if (!reference || reference.isNil || reference.offset > this.file.length || reference.length > this.file.length - reference.offset) {
+			return node.data;
+		}
+
+		const chunk = this.file.subarray(reference.offset, reference.offset + reference.length);
+		const combined = new Uint8Array(node.data.length + chunk.length);
+		combined.set(node.data);
+		combined.set(chunk, node.data.length);
+		return combined;
 	}
 
 	private processNode(node: FileNode, frame: ListFrame): void {
@@ -299,7 +335,18 @@ class GraphReader {
 
 		if (!revision?.isEncrypted) {
 			const objectData = this.referencedRange(node.chunkReference, 0, node.chunkReference.length, 'object property set');
-			record.propertySet = readPropertySet(objectData, globalIds, this.options, node.chunkReference.offset);
+			record.fileOffset = node.chunkReference.offset;
+			try {
+				record.propertySet = readPropertySet(objectData, globalIds, this.options, node.chunkReference.offset);
+			}
+			catch (error) {
+				if (!(error instanceof OneNoteFormatError)) throw error;
+				// The chunk boundary is known and was validated above. Keep the exact
+				// object bytes so one unsupported property does not discard its page,
+				// its siblings, or the remainder of the section.
+				record.rawData = objectData;
+				record.diagnostic = error;
+			}
 		}
 
 		this.result.objects.push(record);

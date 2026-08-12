@@ -25,8 +25,10 @@ export const DEFAULT_READER_OPTIONS: ReaderOptions = {
 	maxPropertySetDepth: 128,
 	maxPageGraphNodes: 100_000,
 	maxInkPathValues: 1_000_000,
-	maxAssetBytes: 64 * 1024 * 1024,
-	maxTotalAssetBytes: 256 * 1024 * 1024,
+	// Do not discard valid user data based on an importer policy. The host's
+	// actual ArrayBuffer/file limits still apply and are reported explicitly.
+	maxAssetBytes: Number.MAX_SAFE_INTEGER,
+	maxTotalAssetBytes: Number.MAX_SAFE_INTEGER,
 	strictHeaderValidation: true,
 	validateTransactionChecksums: true,
 };

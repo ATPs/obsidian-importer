@@ -13,6 +13,7 @@ function page(...elements: Element[]): Page {
 		isDeleted: false,
 		outlines: [{ kind: 'outline', children: elements }],
 		directContent: [],
+		preservation: [],
 	};
 }
 
@@ -49,18 +50,43 @@ test('a link wraps whatever emphasis the run already had', async () => {
 });
 
 test('a OneNote page link becomes a link Obsidian can resolve after import', async () => {
-	assert.equal(
-		await render(para([{
+	const converted = await convertPage(page(para([{
 			text: 'the other page',
 			hyperlinkUrl: 'onenote:///C:/Notebook/Section.one#Other%20page&section-id={section}&page-id={page}&end',
-		}])),
-		'[the other page](Other%20page)');
+		}])), { saveAttachment: async () => null, resolveInternalLink: title => title });
+	assert.equal(converted.markdown, '[the other page](Other%20page)');
 });
 
 test('a malformed OneNote page title is kept rather than failing its page', async () => {
+	const converted = await convertPage(
+		page(para([{ text: 'page', hyperlinkUrl: 'onenote:///Section.one#Bad%escape&section-id={section}' }])),
+		{ saveAttachment: async () => null, resolveInternalLink: title => title });
+	assert.equal(converted.markdown, '[page](Bad%25escape)');
+});
+
+test('an unresolved OneNote page link keeps its stable source URL', async () => {
+	const url = 'onenote:///S.one#Duplicate&section-id={a}&page-id={b}';
+	const converted = await convertPage(page(para([{ text: 'page', hyperlinkUrl: url }])), {
+		saveAttachment: async () => null,
+		resolveInternalLink: () => undefined,
+	});
 	assert.equal(
-		await render(para([{ text: 'page', hyperlinkUrl: 'onenote:///Section.one#Bad%escape&section-id={section}' }])),
-		'[page](Bad%25escape)');
+		converted.markdown,
+		'[page](onenote:///S.one#Duplicate&section-id=%7Ba%7D&page-id=%7Bb%7D) *(OneNote link target was not found in this import)*');
+});
+
+test('an ambiguous OneNote page link lists every imported candidate', async () => {
+	const converted = await convertPage(page(para([{
+		text: 'duplicate page',
+		hyperlinkUrl: 'onenote:///S.one#Duplicate&section-id={a}',
+	}])), {
+		saveAttachment: async () => null,
+		resolveInternalLink: () => ['Section A/Duplicate abc123', 'Section B/Duplicate def456'],
+	});
+
+	assert.equal(
+		converted.markdown,
+		'duplicate page *(OneNote link has multiple pages with this title: [1](Section%20A/Duplicate%20abc123), [2](Section%20B/Duplicate%20def456))*');
 });
 
 test('a run of only whitespace contributes no emphasis markers', async () => {
@@ -212,6 +238,7 @@ test('cancelling stops the conversion where it stands', async () => {
 	});
 
 	assert.equal(converted.markdown, 'first');
+	assert.equal(converted.cancelled, true);
 });
 
 test('an equation becomes LaTeX rather than the glyphs OneNote stored', async () => {

@@ -9,6 +9,35 @@ export interface TextRun {
 	hyperlinkUrl?: string;
 	math?: boolean;
 	highlight?: string;
+	font?: string;
+	fontSize?: number;
+}
+
+/**
+ * Source information that was read successfully but cannot be represented
+ * faithfully in Markdown. Binary payloads are written beside the note and
+ * referenced by the preservation XML.
+ */
+export interface PreservedProperty {
+	rawId: number;
+	index: number;
+	booleanValue?: boolean;
+	scalarValue?: number;
+	data?: Uint8Array;
+	referencedIds?: string[];
+	childPropertyId?: number;
+	children?: PreservedProperty[][];
+}
+
+export interface PreservationRecord {
+	code: string;
+	message: string;
+	objectId?: string;
+	jcid?: number;
+	offset?: number;
+	properties?: PreservedProperty[];
+	rawData?: Uint8Array;
+	details?: Record<string, string | number | boolean>;
 }
 
 export interface Tag {
@@ -95,10 +124,13 @@ export interface Page {
 	isDeleted: boolean;
 	outlines: Outline[];
 	directContent: Element[];
+	preservation: PreservationRecord[];
 }
 
 export interface Section {
+	id: string;
 	name: string;
 	colorArgb?: number;
 	pages: Page[];
+	preservation: PreservationRecord[];
 }

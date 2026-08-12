@@ -10,6 +10,7 @@ export interface MaterializedObjectSpace {
 	revision: RevisionManifest;
 	getObject(id: ExtendedGuid): RevisionStoreObject | undefined;
 	getRoot(role: number): RevisionStoreObject | undefined;
+	objects(): Iterable<RevisionStoreObject>;
 }
 
 export function spaceKey(id: ExtendedGuid, contextId?: ExtendedGuid): string {
@@ -104,6 +105,7 @@ export class ObjectSpaceMaterializer {
 				const rootId = roots.get(role);
 				return rootId ? objects.get(keyOf(rootId)) : undefined;
 			},
+			objects: () => objects.values(),
 		};
 
 		this.cache.set(key, space);

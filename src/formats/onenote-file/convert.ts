@@ -1,5 +1,6 @@
 import { SvgStroke, strokesToSvg } from '../onenote/ink-svg';
 import { Element, Image, Ink, ListInfo, Page, Paragraph, Table, Tag, TextRun } from './semantic/content';
+import { PreserveBinary, preservationBlock, preservationXml } from './preservation';
 
 /** Converts half-inch ink units to CSS pixels at 96 DPI. */
 const PIXELS_PER_INK_UNIT = 48;
@@ -7,6 +8,8 @@ const PIXELS_PER_INK_UNIT = 48;
 export interface ResolvedAttachment {
 	path: string;
 	name: string;
+	length?: number;
+	sha256?: string;
 }
 
 export type SkipReason =
@@ -17,7 +20,8 @@ export interface OneNoteConversionOptions {
 	/** Writes one asset and answers with the link target, or null to leave it out. */
 	saveAttachment: (data: Uint8Array, suggestedName: string) => Promise<ResolvedAttachment | null>;
 	/** Turns an internal OneNote page title into the note name written by the importer. */
-	resolveInternalLink?: (pageTitle: string) => string;
+	/** Answers with every imported page that can be the target. */
+	resolveInternalLink?: (pageTitle: string) => string | string[] | undefined;
 	onSkipped?: (name: string, reason: SkipReason) => void;
 	/**
 	 * What the note is called, for the attachments named after it. A page title
@@ -25,11 +29,16 @@ export interface OneNoteConversionOptions {
 	 */
 	noteName?: string;
 	isCancelled?: () => boolean;
+	/** Saves opaque source bytes that Markdown cannot represent. */
+	preserveBinary?: PreserveBinary;
 }
 
 export interface ConvertedPage {
 	markdown: string;
 	attachments: ResolvedAttachment[];
+	degraded: boolean;
+	preservationCount: number;
+	cancelled: boolean;
 }
 
 const INVISIBLE_MATH = /[\u2061-\u2064]/g;
@@ -112,14 +121,30 @@ function renderRun(run: TextRun, options: OneNoteConversionOptions): string {
 		if (run.strikethrough) core = `~~${core}~~`;
 		if (run.hyperlinkUrl) {
 			const pageTitle = internalPageTitle(run.hyperlinkUrl);
-			const target = pageTitle
-				? options.resolveInternalLink?.(pageTitle) ?? pageTitle
-				: run.hyperlinkUrl;
-			core = `[${core}](${encodeURI(target)})`;
+			const resolved = pageTitle ? options.resolveInternalLink?.(pageTitle) : undefined;
+			const targets = Array.isArray(resolved) ? resolved : resolved === undefined ? [] : [resolved];
+
+			if (!pageTitle || options.resolveInternalLink === undefined) {
+				core = `[${core}](${encodeURI(resolved as string | undefined ?? pageTitle ?? run.hyperlinkUrl)})`;
+			}
+			else if (targets.length === 1) {
+				core = `[${core}](${encodeURI(targets[0])})`;
+			}
+			else if (targets.length > 1) {
+				const links = targets.map((target, index) => `[${index + 1}](${encodeURI(target)})`).join(', ');
+				core = `${core} *(OneNote link has multiple pages with this title: ${links})*`;
+			}
+			else {
+				core = `[${core}](${encodeURI(run.hyperlinkUrl)}) *(OneNote link target was not found in this import)*`;
+			}
 		}
 	}
 
 	return leading + core + trailing;
+}
+
+function runNeedsPreservation(run: TextRun): boolean {
+	return run.font !== undefined || run.fontSize !== undefined;
 }
 
 function renderRuns(runs: TextRun[], options: OneNoteConversionOptions): string {
@@ -221,8 +246,11 @@ class PageWriter {
 	private readonly inkStrokes: SvgStroke[] = [];
 	private readonly recognizedText: string[] = [];
 	readonly attachments: ResolvedAttachment[] = [];
+	readonly preservation: Page['preservation'];
+	cancelled = false;
 
-	constructor(private readonly options: OneNoteConversionOptions, private readonly pageTitle: string) {
+	constructor(private readonly options: OneNoteConversionOptions, private readonly pageTitle: string, initial: Page['preservation']) {
+		this.preservation = [...initial];
 	}
 
 	get markdown(): string {
@@ -256,7 +284,10 @@ class PageWriter {
 
 	async writeElements(elements: Element[]): Promise<void> {
 		for (const element of elements) {
-			if (this.options.isCancelled?.()) return;
+			if (this.options.isCancelled?.()) {
+				this.cancelled = true;
+				return;
+			}
 			await this.writeElement(element);
 		}
 	}
@@ -368,12 +399,23 @@ class PageWriter {
 	private async renderAsset(data: Uint8Array | undefined, name: string, label: string, embed: boolean): Promise<string | undefined> {
 		if (!data || data.length === 0) {
 			this.options.onSkipped?.(name, 'no-data');
+			this.preservation.push({
+				code: 'ONENOTE_ASSET_DATA_MISSING',
+				message: 'OneNote described an attachment or image but its payload was not available.',
+				details: { name, label, embed },
+			});
 			return undefined;
 		}
 
 		const attachment = await this.options.saveAttachment(data, name);
 		if (!attachment) {
 			this.options.onSkipped?.(name, 'no-data');
+			this.preservation.push({
+				code: 'ONENOTE_ASSET_NOT_SAVED',
+				message: 'An attachment or image was read but the destination refused it.',
+				details: { name, label, embed, length: data.length },
+				rawData: data,
+			});
 			return undefined;
 		}
 
@@ -407,20 +449,149 @@ class PageWriter {
 					break;
 				case 'table':
 					this.options.onSkipped?.(this.pageTitle, 'not-representable');
+					await this.preserveNestedTableAssets(child);
+					this.preservation.push({
+						code: 'ONENOTE_NESTED_TABLE',
+						message: 'A table nested inside a table cell has no equivalent in Markdown tables.',
+						details: { rows: child.rows.length },
+					});
 					break;
 			}
 		}
 
 		return parts.filter(part => part !== '').join(' ');
 	}
+
+	private async preserveNestedTableAssets(table: Table): Promise<void> {
+		const visit = async (element: Element): Promise<void> => {
+			if (element.kind === 'image' || element.kind === 'embedded-file') {
+				if (!element.data || element.data.length === 0) return;
+				const name = element.kind === 'image'
+					? withExtension(element.fileName ?? `${this.pageTitle} nested-table image`, element.extension)
+					: withExtension(element.fileName ?? 'nested-table attachment', element.extension);
+				this.preservation.push({
+					code: 'ONENOTE_NESTED_TABLE_ASSET',
+					message: 'An asset inside an unrepresentable nested table is preserved as opaque source data.',
+					details: { name, kind: element.kind },
+					rawData: element.data,
+				});
+				return;
+			}
+			if (element.kind === 'paragraph' || element.kind === 'outline') {
+				for (const child of element.children) await visit(child);
+			}
+			else if (element.kind === 'table') {
+				for (const row of element.rows) for (const cell of row.cells) for (const child of cell.children) await visit(child);
+			}
+		};
+
+		await visit(table);
+	}
 }
 
 export async function convertPage(page: Page, options: OneNoteConversionOptions): Promise<ConvertedPage> {
-	const writer = new PageWriter(options, options.noteName ?? page.title);
+	const writer = new PageWriter(options, options.noteName ?? page.title, page.preservation);
 
 	await writer.writeElements(page.outlines);
 	await writer.writeElements(page.directContent);
 	await writer.writeCollectedInk();
 
-	return { markdown: writer.markdown, attachments: writer.attachments };
+	const records = writer.preservation;
+	const formattedRuns: {
+		font?: string;
+		fontSize?: number;
+		highlight?: string;
+		hyperlinkUrl?: string;
+		math?: boolean;
+		text: string;
+	}[] = [];
+	const taggedParagraphs: { text: string, tags: Tag[] }[] = [];
+	const specialAssets: Record<string, string | number>[] = [];
+	const visit = (element: Element): void => {
+		if (element.kind === 'paragraph') {
+			for (const run of element.runs) {
+				if (runNeedsPreservation(run) || run.highlight || run.hyperlinkUrl || run.math) {
+					formattedRuns.push({
+						text: run.text,
+						font: run.font,
+						fontSize: run.fontSize,
+						highlight: run.highlight,
+						hyperlinkUrl: run.hyperlinkUrl,
+						math: run.math,
+					});
+				}
+			}
+			if (element.tags?.length) taggedParagraphs.push({ text: element.runs.map(run => run.text).join(''), tags: element.tags });
+			for (const child of element.children) visit(child);
+		}
+		else if (element.kind === 'outline') element.children.forEach(visit);
+		else if (element.kind === 'table') {
+			for (const row of element.rows) for (const cell of row.cells) cell.children.forEach(visit);
+		}
+		else if (element.kind === 'image') {
+			specialAssets.push({ kind: 'image', originalName: element.fileName ?? '', altText: element.altText ?? '', extension: element.extension ?? '' });
+		}
+		else if (element.kind === 'embedded-file') {
+			specialAssets.push({
+				kind: 'embedded-file',
+				originalName: element.fileName ?? '',
+				sourcePath: element.sourcePath ?? '',
+				extension: element.extension ?? '',
+			});
+		}
+	};
+	page.outlines.forEach(visit);
+	page.directContent.forEach(visit);
+
+	if (formattedRuns.length > 0) {
+		const details: Record<string, string | number | boolean> = {};
+		for (const [index, run] of formattedRuns.entries()) {
+			details[`run-${index}-text`] = run.text;
+			if (run.font !== undefined) details[`run-${index}-font`] = run.font;
+			if (run.fontSize !== undefined) details[`run-${index}-font-size`] = run.fontSize;
+			if (run.highlight !== undefined) details[`run-${index}-highlight`] = run.highlight;
+			if (run.hyperlinkUrl !== undefined) details[`run-${index}-hyperlink`] = run.hyperlinkUrl;
+			if (run.math !== undefined) details[`run-${index}-math`] = run.math;
+		}
+		records.push({
+			code: 'ONENOTE_TEXT_SOURCE_FORMAT',
+			message: 'OneNote text formatting or source link cannot be represented reversibly in portable Markdown.',
+			details,
+		});
+	}
+	for (const [index, paragraph] of taggedParagraphs.entries()) {
+		const details: Record<string, string | number | boolean> = { text: paragraph.text };
+		for (const [tagIndex, tag] of paragraph.tags.entries()) {
+			if (tag.label !== undefined) details[`tag-${tagIndex}-label`] = tag.label;
+			if (tag.shape !== undefined) details[`tag-${tagIndex}-shape`] = tag.shape;
+			details[`tag-${tagIndex}-checkable`] = tag.checkable;
+			details[`tag-${tagIndex}-completed`] = tag.completed;
+		}
+		records.push({
+			code: 'ONENOTE_TAG_SOURCE',
+			message: 'The exact OneNote tag definition and state are preserved alongside their Markdown approximation.',
+			details: { paragraph: index, ...details },
+		});
+	}
+	for (const [index, details] of specialAssets.entries()) {
+		records.push({
+			code: 'ONENOTE_ASSET_SOURCE_METADATA',
+			message: 'Original OneNote attachment metadata is preserved because the vault path may be sanitized or renamed.',
+			details: { asset: index, ...details },
+		});
+	}
+
+	let markdown = writer.markdown;
+	if (records.length > 0 && options.preserveBinary) {
+		const xml = await preservationXml(records, options.preserveBinary);
+		markdown = [markdown, preservationBlock(xml)].filter(part => part !== '').join('\n\n');
+	}
+
+	return {
+		markdown,
+		attachments: writer.attachments,
+		degraded: records.length > 0,
+		preservationCount: records.length,
+		cancelled: writer.cancelled,
+	};
 }

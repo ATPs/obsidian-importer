@@ -23,6 +23,8 @@ import {
 	TableRow,
 	Tag,
 	TextRun,
+	PreservedProperty,
+	PreservationRecord,
 } from './content';
 import {
 	InkDimensionId,
@@ -58,7 +60,20 @@ export function mapSection(store: RevisionStore, options: ReaderOptions = DEFAUL
 		throw new OneNoteFormatError('ONENOTE_SECTION_OBJECT_SPACE', 'No current section object space could be materialized.');
 	}
 
-	const section: Section = { name: '', pages: [] };
+	const section: Section = {
+		id: sectionSpace.revision.objectSpaceId ? keyOf(sectionSpace.revision.objectSpaceId) : keyOf(sectionSpace.revision.id),
+		name: '',
+		pages: [],
+		preservation: [],
+	};
+	for (const diagnostic of store.graph.diagnostics) {
+		section.preservation.push({
+			code: diagnostic.code,
+			message: diagnostic.message,
+			offset: diagnostic.offset,
+			rawData: diagnostic.rawData,
+		});
+	}
 	const metadata = sectionSpace.getRoot(2);
 
 	if (metadata?.jcid === Jcid.sectionMetadata) {
@@ -74,12 +89,37 @@ export function mapSection(store: RevisionStore, options: ReaderOptions = DEFAUL
 	const visitedPages = new Set<string>();
 	for (const pageSeriesId of readReferences(sectionRoot, Property.elementChildNodes)) {
 		const pageSeries = sectionSpace.getObject(pageSeriesId);
-		if (pageSeries?.jcid !== Jcid.pageSeriesNode) continue;
+		if (pageSeries?.jcid !== Jcid.pageSeriesNode) {
+			section.preservation.push({
+				code: 'ONENOTE_PAGE_SERIES_MISSING',
+				message: 'A section page-series reference could not be materialized.',
+				objectId: keyOf(pageSeriesId),
+			});
+			continue;
+		}
 
 		for (const objectSpaceId of readReferences(pageSeries, Property.childGraphSpaceElementNodes)) {
-			const page = mapPage(materializer, objectSpaceId, options, visitedPages);
+			const page = mapPage(materializer, objectSpaceId, options, visitedPages, section.preservation);
 			if (page) section.pages.push(page);
 		}
+	}
+
+	for (const object of sectionSpace.objects()) {
+		if (object.diagnostic) section.preservation.push(recordFor(object, object.diagnostic.code, object.diagnostic.message));
+		preserveUnhandledProperties(section.preservation, object);
+	}
+
+	const referencedFileData = new Set(store.graph.objects
+		.map(object => normalizedFileDataReference(object.fileDataReference))
+		.filter((reference): reference is string => reference !== undefined));
+	for (const fileData of store.graph.fileDataObjects) {
+		if (referencedFileData.has(fileData.referenceId.toLowerCase())) continue;
+		section.preservation.push({
+			code: 'ONENOTE_ORPHAN_FILE_DATA',
+			message: 'A OneNote file-data payload was present but no current object referenced it.',
+			details: { referenceId: fileData.referenceId, length: fileData.payload.length },
+			rawData: fileData.payload,
+		});
 	}
 
 	return section;
@@ -90,16 +130,32 @@ function mapPage(
 	objectSpaceId: ExtendedGuid,
 	options: ReaderOptions,
 	visitedPages: Set<string>,
+	diagnostics: PreservationRecord[],
 ): Page | undefined {
 	const key = spaceKey(objectSpaceId);
-	if (visitedPages.has(key) || visitedPages.size >= options.maxPageGraphNodes) return undefined;
+	if (visitedPages.has(key) || visitedPages.size >= options.maxPageGraphNodes) {
+		diagnostics.push({
+			code: visitedPages.has(key) ? 'ONENOTE_DUPLICATE_PAGE_GRAPH' : 'ONENOTE_PAGE_GRAPH_LIMIT',
+			message: visitedPages.has(key)
+				? 'A page graph was referenced more than once.'
+				: 'The safe page-graph traversal limit was reached.',
+			objectId: key,
+		});
+		return undefined;
+	}
 	visitedPages.add(key);
 
 	const space = materializer.tryGetSpace(objectSpaceId);
-	if (!space) return undefined;
+	if (!space) {
+		diagnostics.push({ code: 'ONENOTE_PAGE_SPACE_MISSING', message: 'A page object space could not be materialized.', objectId: key });
+		return undefined;
+	}
 
 	const manifest = space.getRoot(1);
-	if (manifest?.jcid !== Jcid.pageManifestNode) return undefined;
+	if (manifest?.jcid !== Jcid.pageManifestNode) {
+		diagnostics.push({ code: 'ONENOTE_PAGE_MANIFEST_MISSING', message: 'A page object space has no usable manifest.', objectId: key });
+		return undefined;
+	}
 
 	const metadata = space.getRoot(2);
 	const revisionMetadata = space.getRoot(4);
@@ -112,7 +168,10 @@ function mapPage(
 			break;
 		}
 	}
-	if (!pageNode) return undefined;
+	if (!pageNode) {
+		diagnostics.push({ code: 'ONENOTE_PAGE_NODE_MISSING', message: 'A page manifest has no usable current page node.', objectId: key });
+		return undefined;
+	}
 
 	const page: Page = {
 		id: keyOf(objectSpaceId),
@@ -124,6 +183,7 @@ function mapPage(
 		isDeleted: readData(metadata, Property.isDeletedGraphSpaceContent) !== undefined,
 		outlines: [],
 		directContent: [],
+		preservation: [],
 	};
 
 	const context: MapContext = {
@@ -131,12 +191,18 @@ function mapPage(
 		materializer,
 		options,
 		recognition: collectRecognition(space, pageNode),
+		preservation: page.preservation,
 	};
 
 	for (const childId of readReferences(pageNode, Property.elementChildNodes)) {
 		const element = buildElement(context, childId, 0, new Set());
 		if (element?.kind === 'outline') page.outlines.push(element);
 		else if (element) page.directContent.push(element);
+	}
+
+	for (const object of space.objects()) {
+		if (object.diagnostic) page.preservation.push(recordFor(object, object.diagnostic.code, object.diagnostic.message));
+		preserveUnhandledProperties(page.preservation, object);
 	}
 
 	if (page.title.trim() === '') {
@@ -161,6 +227,7 @@ interface MapContext {
 	materializer: ObjectSpaceMaterializer;
 	options: ReaderOptions;
 	recognition: Map<string, string>;
+	preservation: PreservationRecord[];
 }
 
 function buildElement(
@@ -171,12 +238,28 @@ function buildElement(
 ): Element | undefined {
 	const { space, options } = context;
 	const pathKey = keyOf(id);
-	if (depth >= options.maxPropertySetDepth || path.has(pathKey)) return undefined;
+	if (depth >= options.maxPropertySetDepth || path.has(pathKey)) {
+		context.preservation.push({
+			code: path.has(pathKey) ? 'ONENOTE_ELEMENT_CYCLE' : 'ONENOTE_ELEMENT_DEPTH_LIMIT',
+			message: path.has(pathKey)
+				? 'An element reference cycle could not be represented in Markdown.'
+				: 'An element exceeded the safe traversal depth and could not be represented in Markdown.',
+			objectId: pathKey,
+		});
+		return undefined;
+	}
 	path.add(pathKey);
 
 	try {
 		const item = space.getObject(id);
-		if (!item) return undefined;
+		if (!item) {
+			context.preservation.push({
+				code: 'ONENOTE_MISSING_OBJECT',
+				message: 'An element references an object that is not present in the materialized page.',
+				objectId: pathKey,
+			});
+			return undefined;
+		}
 
 		switch (item.jcid) {
 			case Jcid.outlineNode:
@@ -208,6 +291,10 @@ function buildElement(
 				return buildInk(context, item);
 
 			default:
+				context.preservation.push(recordFor(
+					item,
+					'ONENOTE_UNSUPPORTED_ELEMENT',
+					`OneNote element JCID 0x${item.jcid.toString(16)} has no Markdown representation.`));
 				return undefined;
 		}
 	}
@@ -318,11 +405,93 @@ function applyTextStyle(run: TextRun, style: RevisionStoreObject | undefined): v
 	if (readBoolean(style, Property.strikethrough)) run.strikethrough = true;
 	if (readBoolean(style, Property.superscript)) run.superscript = true;
 	if (readBoolean(style, Property.subscript)) run.subscript = true;
+	run.font = readString(style, Property.font);
+	run.fontSize = readUInt32Property(style, Property.fontSize);
 
 	if (readBoolean(style, Property.hyperlink)) {
 		const url = readString(style, Property.hyperlinkUrl);
 		if (url) run.hyperlinkUrl = url;
 	}
+}
+
+function propertyForXml(property: PropertySet['properties'][number]): PreservedProperty {
+	return {
+		rawId: property.rawId,
+		index: property.index,
+		booleanValue: property.booleanValue,
+		scalarValue: property.scalarValue,
+		data: property.data,
+		referencedIds: property.referencedIds?.map(keyOf),
+		childPropertyId: property.childPropertyId,
+		children: property.childPropertySets?.map(set => set.properties.map(propertyForXml)),
+	};
+}
+
+function recordFor(object: RevisionStoreObject, code: string, message: string): PreservationRecord {
+	return {
+		code,
+		message,
+		objectId: keyOf(object.id),
+		jcid: object.jcid,
+		offset: object.diagnostic?.offset ?? object.fileOffset,
+		properties: object.propertySet?.properties.map(propertyForXml),
+		rawData: object.rawData,
+		details: {
+			...(object.fileDataReference === undefined ? {} : { fileDataReference: object.fileDataReference }),
+			...(object.fileExtension === undefined ? {} : { fileExtension: object.fileExtension }),
+		},
+	};
+}
+
+function normalizedFileDataReference(reference: string | undefined): string | undefined {
+	if (!reference?.toLowerCase().startsWith('<ifndf>')) return undefined;
+	return reference.slice(7).trim().replace(/\0+$/, '').replace(/^\{|\}$/g, '').toLowerCase();
+}
+
+/** Properties whose complete source meaning is represented by the semantic model. */
+const CONSUMED_PROPERTIES = new Set<number>([
+	Property.contentChildNodes,
+	Property.elementChildNodes,
+	Property.structureElementChildNodes,
+	Property.listNodes,
+	Property.richEditTextUnicode,
+	Property.textExtendedAscii,
+	Property.childGraphSpaceElementNodes,
+	Property.cachedTitleString,
+	Property.cachedTitleStringFromPage,
+	Property.sectionDisplayName,
+	Property.notebookColor,
+	Property.pageLevel,
+	Property.topologyCreationTimestamp,
+	Property.lastModifiedTimestamp,
+	Property.lastModifiedTime,
+	Property.isConflictPage,
+	Property.isDeletedGraphSpaceContent,
+	// Run boundaries, formatting, links, tags, paragraph/list styles, assets,
+	// tables and ink are converted approximately. Their exact source properties
+	// deliberately remain outside this set and are written to preservation XML.
+	Property.bold,
+	Property.italic,
+	Property.underline,
+	Property.strikethrough,
+	Property.superscript,
+	Property.subscript,
+	Property.outlineElementChildLevel,
+].map(id => id & 0x03ffffff));
+
+function preserveUnhandledProperties(into: PreservationRecord[], object: RevisionStoreObject): void {
+	if (!object.propertySet) return;
+	const properties = object.propertySet.properties.filter(property => !CONSUMED_PROPERTIES.has(property.rawId & 0x03ffffff));
+	if (properties.length === 0) return;
+
+	into.push({
+		code: 'ONENOTE_UNREPRESENTED_PROPERTIES',
+		message: 'OneNote object properties were parsed but have no exact Markdown or metadata representation.',
+		objectId: keyOf(object.id),
+		jcid: object.jcid,
+		offset: object.fileOffset,
+		properties: properties.map(propertyForXml),
+	});
 }
 
 /** OneNote stores colors as 0x00BBGGRR. */
@@ -340,7 +509,7 @@ function buildTags(space: MaterializedObjectSpace, item: RevisionStoreObject): T
 	if (!states || states.length === 0) return undefined;
 
 	const tags: Tag[] = [];
-	for (const state of states.slice(0, MAX_TAGS_PER_PARAGRAPH)) {
+	for (const state of states) {
 		const status = readSetUInt32(state, Property.actionItemStatus) ?? 0;
 
 		if ((status & 0x10) !== 0) continue;
@@ -374,8 +543,6 @@ function isCheckableShape(shape: number): boolean {
 function readSetUInt32(set: PropertySet, propertyId: number): number | undefined {
 	return findProperty(set, propertyId)?.scalarValue;
 }
-
-const MAX_TAGS_PER_PARAGRAPH = 9;
 
 function buildListInfo(space: MaterializedObjectSpace, item: RevisionStoreObject): ListInfo | undefined {
 	let listNode: RevisionStoreObject | undefined;

@@ -1,23 +1,55 @@
 import { Notice, Platform, TFile, TFolder, normalizePath } from 'obsidian';
 import { helpUrl } from '../constants';
 import { PickedFile, fs, os, path as nodePath } from '../filesystem';
-import { FormatImporter, leavesTheNoteAlone } from '../format-importer';
+import { FormatImporter, PlannedNote, leavesTheNoteAlone } from '../format-importer';
 import { ImportContext } from '../import-context';
 import { i18n } from '../i18n';
 import { selectedNodes } from '../tree';
 import { TreePicker, ViewableNode } from '../tree-view';
-import { describeReason, extensionFromBytes, sanitizeFileName, uint8arrayToArrayBuffer } from '../util';
+import { describeReason, extensionFromBytes, parseFrontMatterBlock, sanitizeFileName, serializeFrontMatter, uint8arrayToArrayBuffer } from '../util';
 import { findBackupFolder } from './onenote-file/backup-folder';
 import { convertPage } from './onenote-file/convert';
 import { OneNoteErrorKind, OneNoteFormatError } from './onenote-file/errors';
 import { isPackage, listSections, readSections } from './onenote-file/package';
+import { preservationBlock, preservationXml, sha256Hex } from './onenote-file/preservation';
 import { Page, Section } from './onenote-file/semantic/content';
+import { retryTransient } from './onenote-file/retry';
 
 const HELP_PERMALINK = 'import/onenote';
 
 interface SectionNode extends ViewableNode<SectionNode> {
 	file: PickedFile;
 	entryName?: string;
+}
+
+interface SourceIdentity {
+	path: string;
+	sha256: string;
+}
+
+interface PreparedSection {
+	section: Section;
+	title: string;
+	groups: string[];
+	source: SourceIdentity;
+}
+
+interface GeneratedAsset {
+	path: string;
+	length: number;
+	sha256: string;
+}
+
+interface PlannedSection {
+	item: PreparedSection;
+	folderPath: string;
+	pages: Map<Page, PlannedPage>;
+}
+
+interface PlannedPage {
+	note: PlannedNote;
+	/** Readable sanitized name before an actual Windows path limit truncates it. */
+	fullOutputFilename: string;
 }
 
 const REASONS: Record<OneNoteErrorKind, () => string> = {
@@ -98,7 +130,7 @@ export class OneNoteFileImporter extends FormatImporter {
 			const nodes: SectionNode[] = [];
 
 			for (const file of this.files) {
-				const data = new Uint8Array(await file.read());
+				const data = new Uint8Array(await retryTransient(() => file.read()));
 
 				// Ignore a read superseded while it was in progress.
 				if (generation !== this.loadGeneration) return this.picker.nodes;
@@ -147,6 +179,7 @@ export class OneNoteFileImporter extends FormatImporter {
 		const loaded = nodes.length > 0;
 		const chosen = selectedNodes(nodes, node => !node.children?.length);
 
+		const prepared: PreparedSection[] = [];
 		for (const file of this.files) {
 			if (await ctx.shouldStop()) return;
 
@@ -158,23 +191,83 @@ export class OneNoteFileImporter extends FormatImporter {
 				: undefined;
 
 			try {
-				await this.importFile(ctx, file, folder, wanted);
+				prepared.push(...await this.prepareFile(ctx, file, wanted));
 			}
 			catch (error) {
-				report(ctx, file.name, error);
+				report(ctx, `${file.name} (${file.toString()})`, error);
+			}
+		}
+
+		const planned = this.planSections(prepared, folder);
+		const links = oneNoteLinkNames(
+			prepared.flatMap(item => item.section.pages),
+			new Map([...planned].flatMap(section => [...section.pages].map(([page, plan]) => [page.id, linkTarget(plan.note.targetPath)]))));
+		for (const section of planned) {
+			if (await ctx.shouldStop()) return;
+			try {
+				await this.importSection(ctx, section, links);
+			}
+			catch (error) {
+				const { item } = section;
+				report(ctx, `${item.title} (${item.source.path}; SHA-256 ${item.source.sha256})`, error);
 			}
 		}
 	}
 
-	private async importFile(ctx: ImportContext, file: PickedFile, folder: TFolder, wanted?: Set<string>): Promise<void> {
+	private planSections(prepared: PreparedSection[], root: TFolder): PlannedSection[] {
+		const names = oneNotePageNames(prepared.flatMap(item => item.section.pages));
+		const planned: PlannedSection[] = [];
+
+		for (const item of prepared) {
+			let folderPath = root.path === '/' ? '' : root.path;
+			for (const group of item.groups) folderPath = appendName(folderPath, sanitizeFileName(group, folderPath));
+			folderPath = appendName(folderPath, sanitizeFileName(item.section.name || item.title, folderPath));
+
+			const pages = new Map<Page, PlannedPage>();
+			const levels: string[] = [folderPath];
+			for (const page of item.section.pages) {
+				const depth = Math.min(page.level, levels.length - 1);
+				levels.length = depth + 1;
+
+				let parent = levels[depth];
+				if (page.isDeleted) parent = appendName(folderPath, '_deleted');
+				else if (page.isConflictPage) parent = appendName(folderPath, '_conflicts');
+
+				const proposed = names.get(page.id)!;
+				const actual = sanitizeFileName(proposed, parent);
+				const title = actual === proposed
+					? proposed
+					: sanitizeFileName(`${shortOneNoteId(page.id)} ${actual}`, parent);
+				const note = this.planNote(parent, title, page.id);
+				pages.set(page, { note, fullOutputFilename: `${proposed}.md` });
+				levels.push(linkTarget(note.targetPath));
+			}
+			planned.push({ item, folderPath, pages });
+		}
+
+		return planned;
+	}
+
+	private async prepareFile(ctx: ImportContext, file: PickedFile, wanted?: Set<string>): Promise<PreparedSection[]> {
 		ctx.status(i18n.importer.onenoteFile.statusReadingSection({ name: file.name }));
 
-		const data = new Uint8Array(await file.read());
-		const sections = readSections(data, file.name, wanted?.size ? wanted : undefined);
+		const data = new Uint8Array(await retryTransient(() => file.read(), {
+			onRetry: attempt => ctx.reportMessage(`Retrying OneNote source read for ${file.name} (attempt ${attempt}/3).`),
+		}));
+		const source: SourceIdentity = { path: file.toString(), sha256: await sha256Hex(data) };
+		let sections;
+		try {
+			sections = readSections(data, file.name, wanted?.size ? wanted : undefined);
+		}
+		catch (error) {
+			report(ctx, `${file.name} (${source.path}; ${data.length} bytes; SHA-256 ${source.sha256})`, error);
+			return [];
+		}
+		const prepared: PreparedSection[] = [];
 		let done = 0;
 
 		for (const entry of sections) {
-			if (await ctx.shouldStop()) return;
+			if (await ctx.shouldStop()) return prepared;
 
 			ctx.status(i18n.importer.onenoteFile.statusImportingSection({
 				name: entry.title,
@@ -187,80 +280,226 @@ export class OneNoteFileImporter extends FormatImporter {
 				section = entry.read();
 			}
 			catch (error) {
-				report(ctx, entry.title, error);
+				report(ctx, `${entry.title} (${source.path}; ${data.length} bytes; SHA-256 ${source.sha256})`, error);
 				continue;
 			}
 
-			await this.importSection(ctx, section, entry.title, folder, entry.groups);
+			prepared.push({ section, title: entry.title, groups: entry.groups, source });
 		}
+
+		return prepared;
 	}
 
-	private async importSection(ctx: ImportContext, section: Section, fallbackName: string, folder: TFolder, groups: string[] = []): Promise<void> {
-		// A section inside section groups keeps them, as OneNote shows them.
-		const within = groups.map(group => sanitizeFileName(group)).join('/');
-		const parent = within ? `${folder.path}/${within}` : folder.path;
-		const sectionFolder = await this.createFolders(normalizePath(`${parent}/${sanitizeFileName(section.name || fallbackName)}`));
-
-		// Create a page folder only when its first subpage arrives.
-		const levels: { folder?: TFolder, path?: string }[] = [{ folder: sectionFolder }];
+	private async importSection(
+		ctx: ImportContext,
+		planned: PlannedSection,
+		links: Map<string, string[]>,
+	): Promise<void> {
+		const { item, pages, folderPath } = planned;
+		const { section, title: fallbackName, groups, source } = item;
+		const sectionFolder = await this.createFolders(folderPath);
 		let done = 0;
-
-		const folderFor = async (depth: number): Promise<TFolder> => {
-			const level = levels[depth];
-			level.folder ??= await this.createFolders(normalizePath(level.path!));
-			return level.folder;
-		};
 
 		for (const page of section.pages) {
 			if (await ctx.shouldStop()) return;
-			if (page.isDeleted) continue;
 
 			ctx.reportProgress(++done, section.pages.length);
-
-			const depth = Math.min(page.level, levels.length - 1);
-			levels.length = depth + 1;
-
-			const target = await folderFor(depth);
-			const written = await this.importPage(ctx, page, target);
-
-			levels.push(written ? { path: `${target.path}/${written}` } : { folder: target });
+			const plan = pages.get(page)!;
+			const { note } = plan;
+			await this.createFolders(note.targetPath.slice(0, note.targetPath.lastIndexOf('/')) || '/');
+			await this.importPage(ctx, page, plan, links, section.id, source);
 		}
+
+		await this.importSectionArchive(ctx, section, sectionFolder, fallbackName, groups, source);
 	}
 
-	private async importPage(ctx: ImportContext, page: Page, sectionFolder: TFolder): Promise<string | undefined> {
-		const title = sanitizeFileName(page.title);
+	private async importPage(
+		ctx: ImportContext,
+		page: Page,
+		plan: PlannedPage,
+		links: Map<string, string[]>,
+		sectionId: string,
+		source: SourceIdentity,
+	): Promise<string | undefined> {
+		const { note: planned } = plan;
+		const title = planned.title;
+		const generatedAssets: GeneratedAsset[] = [];
 
 		try {
 			// Preflight before conversion so skipped notes write no attachments.
-			const planned = this.planNote(sectionFolder, title, page.id);
 			const disposition = this.preflightNote(ctx, planned, page.lastModifiedUtc?.getTime());
 			if (leavesTheNoteAlone(disposition)) return title;
 
 			const notePath = planned.targetPath;
+			const oldAssets = planned.file ? assetsIn(await this.vault.read(planned.file)) : [];
+			const save = async (bytes: Uint8Array, suggested: string) => {
+				const saved = await this.saveAttachment(ctx, bytes, suggested, notePath);
+				const asset = { path: saved.path, length: bytes.length, sha256: await sha256Hex(bytes) };
+				generatedAssets.push(asset);
+				return { ...saved, ...asset };
+			};
 			const converted = await convertPage(page, {
 				noteName: title,
 				isCancelled: () => ctx.isCancelled(),
-				resolveInternalLink: pageTitle => sanitizeFileName(pageTitle),
+				resolveInternalLink: pageTitle => links.get(pageTitle.normalize('NFC').toLocaleLowerCase()),
 				onSkipped: (name, reason) => ctx.reportSkipped(name, reason === 'no-data'
 					? i18n.importer.onenoteFile.reasonNoAttachmentData()
 					: i18n.importer.onenoteFile.reasonNotRepresentable()),
-				saveAttachment: (bytes, suggested) => this.saveAttachment(ctx, bytes, suggested, notePath),
+				saveAttachment: save,
+				preserveBinary: async (bytes, suggested) => {
+					return await save(bytes, `.onenote-preserved-${suggested}`);
+				},
+			});
+			if (converted.cancelled) {
+				for (const asset of uniqueAssets(generatedAssets)) {
+					ctx.reportMessage(`${asset.path}: preserved as an orphan because page conversion was cancelled.`);
+				}
+				return undefined;
+			}
+			const frontMatter = serializeFrontMatter({
+				title: page.title,
+				'onenote-original-filename': page.title === '' ? '' : `${page.title}.md`,
+				'onenote-full-output-filename': plan.fullOutputFilename,
+				'onenote-output-filename': planned.targetPath.slice(planned.targetPath.lastIndexOf('/') + 1),
+				'onenote-id': page.id,
+				'onenote-section-id': sectionId,
+				'onenote-source': source.path,
+				'onenote-source-sha256': source.sha256,
+				'onenote-status': page.isDeleted ? 'deleted' : page.isConflictPage ? 'conflict' : 'current',
+				'onenote-level': page.level,
+				'onenote-created': page.createdUtc?.toISOString(),
+				'onenote-updated': page.lastModifiedUtc?.toISOString(),
+				'onenote-completeness': converted.degraded ? 'degraded' : 'complete',
+				'onenote-assets': uniqueAssets(generatedAssets),
 			});
 
-			const { written } = await this.writePlannedNote(ctx, planned, converted.markdown, {
-				sourceId: page.id,
-				ctime: page.createdUtc?.getTime(),
-				mtime: page.lastModifiedUtc?.getTime(),
-				disposition,
-			});
+			const { written } = await this.writePlannedWithRetry(
+				ctx,
+				planned,
+				frontMatter + converted.markdown,
+				{
+					sourceId: page.id,
+					ctime: page.createdUtc?.getTime(),
+					mtime: page.lastModifiedUtc?.getTime(),
+					disposition,
+				},
+				`OneNote note write for ${title}`);
 
-			if (written) ctx.reportNoteSuccess(title);
+			if (written) {
+				ctx.reportNoteSuccess(title);
+				if (converted.degraded) {
+					ctx.reportMessage(`${page.title || title}: imported with ${converted.preservationCount} preserved OneNote item(s).`);
+				}
+				try {
+					await this.removeStaleAssets(ctx, oldAssets, generatedAssets, planned.targetPath);
+				}
+				catch (error) {
+					ctx.reportFailed(`${title}: stale OneNote attachment cleanup`, error);
+				}
+			}
 			return title;
 		}
 		catch (error) {
+			for (const asset of uniqueAssets(generatedAssets)) {
+				ctx.reportMessage(`${asset.path}: preserved as an orphan because its OneNote page could not be committed.`);
+			}
 			ctx.reportFailed(title, error);
 			return undefined;
 		}
+	}
+
+	private async importSectionArchive(
+		ctx: ImportContext,
+		section: Section,
+		folder: TFolder,
+		fallbackName: string,
+		groups: string[],
+		source: SourceIdentity,
+	): Promise<void> {
+		const generatedAssets: GeneratedAsset[] = [];
+		try {
+			const planned = this.planNote(folder, '_OneNote archive', `section:${section.id}`);
+			const disposition = this.preflightNote(ctx, planned);
+			if (leavesTheNoteAlone(disposition)) return;
+
+			const oldAssets = planned.file ? assetsIn(await this.vault.read(planned.file)) : [];
+			const records = [...section.preservation, {
+				code: 'ONENOTE_SECTION_METADATA',
+				message: 'OneNote section metadata has no portable Markdown representation.',
+				details: {
+					name: section.name || fallbackName,
+					...(section.colorArgb === undefined ? {} : { colorArgb: section.colorArgb }),
+					groups: groups.join('/'),
+				},
+			}];
+			const xml = await preservationXml(records, async (bytes, suggested) => {
+				const saved = await this.saveAttachment(ctx, bytes, `.onenote-preserved-${suggested}`, planned.targetPath);
+				const asset = { path: saved.path, length: bytes.length, sha256: await sha256Hex(bytes) };
+				generatedAssets.push(asset);
+				return asset;
+			});
+			const frontMatter = serializeFrontMatter({
+				title: `${section.name || fallbackName} — OneNote archive`,
+				'onenote-section-id': section.id,
+				'onenote-source': source.path,
+				'onenote-source-sha256': source.sha256,
+				'onenote-completeness': section.preservation.length > 0 ? 'degraded' : 'complete',
+				'onenote-assets': uniqueAssets(generatedAssets),
+			});
+			const { written } = await this.writePlannedWithRetry(
+				ctx,
+				planned,
+				frontMatter + preservationBlock(xml),
+				{
+					sourceId: `section:${section.id}`,
+					disposition,
+				},
+				'OneNote section archive write');
+			if (written) {
+				ctx.reportNoteSuccess('_OneNote archive');
+				try {
+					await this.removeStaleAssets(ctx, oldAssets, generatedAssets, planned.targetPath);
+				}
+				catch (error) {
+					ctx.reportFailed(`${section.name || fallbackName} — OneNote archive: stale attachment cleanup`, error);
+				}
+			}
+		}
+		catch (error) {
+			for (const asset of uniqueAssets(generatedAssets)) {
+				ctx.reportMessage(`${asset.path}: preserved as an orphan because its OneNote section archive could not be committed.`);
+			}
+			ctx.reportFailed(`${section.name || fallbackName} — OneNote archive`, error);
+		}
+	}
+
+	private async writePlannedWithRetry(
+		ctx: ImportContext,
+		planned: ReturnType<OneNoteFileImporter['planNote']>,
+		content: string,
+		options: NonNullable<Parameters<OneNoteFileImporter['writePlannedNote']>[3]>,
+		label: string,
+	) {
+		let retried = false;
+		return await retryTransient(async () => {
+			if (retried && !planned.file && options.sourceId && this.idProperty) {
+				const appeared = this.vault.getAbstractFileByPath(planned.targetPath);
+				if (appeared instanceof TFile) {
+					const recorded = this.sourceIdIn(await this.vault.read(appeared), this.idProperty);
+					if (recorded === options.sourceId) {
+						this.trackMarkdownFile(appeared);
+						return { file: appeared, written: true, outcome: 'created' as const };
+					}
+				}
+			}
+
+			return await this.writePlannedNote(ctx, planned, content, options);
+		}, {
+			onRetry: attempt => {
+				retried = true;
+				ctx.reportMessage(`Retrying ${label} (attempt ${attempt}/3).`);
+			},
+		});
 	}
 
 	private async saveAttachment(ctx: ImportContext, bytes: Uint8Array, suggested: string, notePath: string) {
@@ -278,13 +517,102 @@ export class OneNoteFileImporter extends FormatImporter {
 		});
 
 		if (!reuse) {
-			await this.writeAttachment(path, data);
+			await retryTransient(() => this.writeAttachment(path, data), {
+				onRetry: attempt => ctx.reportMessage(`Retrying OneNote attachment write for ${suggested} (attempt ${attempt}/3).`),
+			});
 			ctx.reportAttachmentSuccess(path);
 		}
 
 		return { path: reuse?.path ?? path, name: suggested };
 	}
+
+	private async removeStaleAssets(
+		ctx: ImportContext,
+		oldAssets: GeneratedAsset[],
+		currentAssets: GeneratedAsset[],
+		ownerPath: string,
+	): Promise<void> {
+		const current = new Set(currentAssets.map(asset => normalizePath(asset.path).toLocaleLowerCase()));
+		const shared = new Set<string>();
+		for (const note of this.vault.getMarkdownFiles()) {
+			if (note.path === ownerPath) continue;
+			for (const asset of assetsIn(await this.vault.read(note))) shared.add(normalizePath(asset.path).toLocaleLowerCase());
+		}
+
+		for (const asset of oldAssets) {
+			const key = normalizePath(asset.path).toLocaleLowerCase();
+			if (current.has(key) || shared.has(key)) continue;
+			const file = this.vault.getAbstractFileByPath(asset.path);
+			if (!(file instanceof TFile)) continue;
+			const bytes = new Uint8Array(await this.vault.readBinary(file));
+			if (bytes.length !== asset.length || await sha256Hex(bytes) !== asset.sha256) {
+				ctx.reportMessage(`${asset.path}: kept because it was modified after OneNote imported it.`);
+				continue;
+			}
+			await retryTransient(() => this.app.fileManager.trashFile(file), {
+				onRetry: attempt => ctx.reportMessage(`Retrying stale OneNote attachment removal for ${asset.path} (attempt ${attempt}/3).`),
+			});
+			ctx.reportMessage(`${asset.path}: removed because the updated OneNote page no longer references it.`);
+		}
+	}
 }
+
+export function shortOneNoteId(id: string): string {
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < id.length; index++) {
+		hash ^= id.charCodeAt(index);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0).toString(36).padStart(7, '0');
+}
+
+export function oneNotePageNames(pages: Page[]): Map<string, string> {
+	const base = pages.map(page => sanitizeFileName(page.title));
+	const counts = new Map<string, number>();
+	for (const name of base) counts.set(name.toLocaleLowerCase(), (counts.get(name.toLocaleLowerCase()) ?? 0) + 1);
+
+	return new Map(pages.map((page, index) => {
+		const cleaned = base[index];
+		const lossy = page.title.normalize('NFC').trim() !== cleaned || (counts.get(cleaned.toLocaleLowerCase()) ?? 0) > 1;
+		return [page.id, lossy ? `${shortOneNoteId(page.id)} ${cleaned}` : cleaned];
+	}));
+}
+
+export function oneNoteLinkNames(pages: Page[], names: Map<string, string>): Map<string, string[]> {
+	const found = new Map<string, string[]>();
+	for (const page of pages) {
+		const key = page.title.normalize('NFC').toLocaleLowerCase();
+		const targets = found.get(key) ?? [];
+		targets.push(names.get(page.id)!);
+		found.set(key, targets);
+	}
+	return found;
+}
+
+function uniqueAssets(assets: GeneratedAsset[]): GeneratedAsset[] {
+	return [...new Map(assets.map(asset => [normalizePath(asset.path).toLocaleLowerCase(), asset])).values()];
+}
+
+function assetsIn(markdown: string): GeneratedAsset[] {
+	const value: unknown = parseFrontMatterBlock(markdown)?.frontMatter['onenote-assets'];
+	if (!Array.isArray(value)) return [];
+	return value.flatMap(item => {
+		if (!item || typeof item !== 'object') return [];
+		const asset = item as Partial<GeneratedAsset>;
+		return typeof asset.path === 'string' && typeof asset.length === 'number' && typeof asset.sha256 === 'string'
+			? [{ path: asset.path, length: asset.length, sha256: asset.sha256 }]
+			: [];
+	});
+}
+
+function appendName(parent: string, name: string): string {
+	return normalizePath(parent ? `${parent}/${name}` : name);
+}
+
+function linkTarget(markdownPath: string): string {
+	return markdownPath.replace(/\.md$/i, '');
+}
+
 
 function windowsBackupFolder(): string | undefined {
 	if (!Platform.isWin || !Platform.isDesktopApp || !fs || !nodePath || !os) return undefined;
