@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import nodeFs from 'node:fs';
 import nodePath from 'node:path';
 
-import { readCabinet, readCabinetIndex } from '../../src/formats/onenote-file/cabinet/cabinet';
+import { DEFAULT_CABINET_LIMITS, readCabinet, readCabinetIndex } from '../../src/formats/onenote-file/cabinet/cabinet';
 import { OneNoteFormatError } from '../../src/formats/onenote-file/errors';
 
 const FIXTURES = nodePath.join(__dirname, 'fixtures');
@@ -13,6 +13,25 @@ function fixture(name: string): Uint8Array {
 }
 
 const LIMITS = { maxExpandedBytes: 1024 * 1024, maxEntryBytes: 1024 * 1024, maxEntries: 10 };
+
+test('the default cabinet limits retain decompression-bomb protection', () => {
+	assert.deepEqual(DEFAULT_CABINET_LIMITS, {
+		maxExpandedBytes: 2 * 1024 * 1024 * 1024,
+		maxEntryBytes: 512 * 1024 * 1024,
+		maxEntries: 4096,
+	});
+});
+
+test('an oversized declared entry is rejected while reading the index', () => {
+	const cabinet = fixture('makecab-lzx-testOneNote2016.cab');
+	const view = new DataView(cabinet.buffer, cabinet.byteOffset, cabinet.byteLength);
+	const filesOffset = view.getUint32(16, true);
+	view.setUint32(filesOffset, DEFAULT_CABINET_LIMITS.maxEntryBytes + 1, true);
+
+	assert.throws(
+		() => readCabinetIndex(cabinet),
+		(error: unknown) => error instanceof OneNoteFormatError && error.code === 'ONENOTE_CAB_ENTRY_LIMIT');
+});
 
 function e8OraclePayload(): Uint8Array {
 	const pattern = new TextEncoder().encode('OfficeIMO-LZX-E8-independent-oracle-');

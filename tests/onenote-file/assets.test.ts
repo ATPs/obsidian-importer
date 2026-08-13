@@ -2,28 +2,17 @@ import '../shims/runtime';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { TFile, TFolder } from 'obsidian';
+import type { TFolder } from 'obsidian';
 
 import { OneNoteFileImporter } from '../../src/formats/onenote-file';
 import { ImportContext } from '../../src/import-context';
-import { parseFrontMatterBlock, serializeFrontMatter } from '../../src/util';
-import type { Page, PreservationRecord, Section } from '../../src/formats/onenote-file/semantic/content';
+import { parseFrontMatterBlock } from '../../src/util';
+import type { Page, Section } from '../../src/formats/onenote-file/semantic/content';
 import { MemoryVault, memoryApp } from '../shims/vault';
 
-interface ArchiveAccess {
+interface PageAccess {
 	ready: Promise<void>;
 	indexImportedNotes(): void;
-	importSectionArchive(
-		ctx: ImportContext,
-		section: Section,
-		folder: TFolder,
-		fallbackName: string,
-		groups: string[],
-		source: { path: string, sha256: string },
-	): Promise<void>;
-}
-
-interface PageAccess extends ArchiveAccess {
 	planSections(
 		prepared: { section: Section, title: string, groups: string[], source: { path: string, sha256: string } }[],
 		root: TFolder,
@@ -37,82 +26,73 @@ interface PageAccess extends ArchiveAccess {
 	importSection(ctx: ImportContext, planned: unknown, links: Map<string, string[]>): Promise<void>;
 }
 
-function section(preservation: PreservationRecord[]): Section {
-	return { id: 'section-id', name: 'Section', pages: [], preservation };
+function pageWithAssets(...data: Uint8Array[]): Page {
+	return {
+		id: 'page-id',
+		title: 'Page',
+		level: 0,
+		isConflictPage: false,
+		isDeleted: false,
+		outlines: [],
+		directContent: data.map(bytes => ({ kind: 'image', extension: '.png', data: bytes })),
+		preservation: [],
+	};
+}
+
+function section(): Section {
+	return { id: 'section-id', name: 'Section', pages: [], preservation: [] };
 }
 
 async function importer() {
 	const vault = new MemoryVault();
-	const app = memoryApp(vault) as unknown as {
-		fileManager: { trashFile(file: TFile): Promise<void> };
-	};
-	app.fileManager.trashFile = async file => vault.remove(file.path);
-
-	const subject = new OneNoteFileImporter(app as never, {
+	const subject = new OneNoteFileImporter(memoryApp(vault), {
 		sourceEl: null,
 		outputEl: null,
 		optionsEl: null,
-	} as never) as unknown as ArchiveAccess;
+	} as never) as unknown as PageAccess;
 	await subject.ready;
 	return { vault, subject };
 }
 
-async function writeArchive(subject: ArchiveAccess, vault: MemoryVault, preservation: PreservationRecord[]) {
-	await subject.importSectionArchive(
-		new ImportContext(),
-		section(preservation),
-		vault.root,
-		'Section',
-		[],
-		{ path: 'C:/Notebook/Section.one', sha256: 'source-hash' });
+async function writePages(subject: PageAccess, vault: MemoryVault, ctx: ImportContext, pages: Page[]) {
+	const source = { path: 'C:/Notebook/Section.one', sha256: 'source-hash' };
+	const input = { section: { ...section(), pages }, title: 'Section', groups: [], source };
+	const [planned] = subject.planSections([input], vault.root);
+	await subject.importSection(ctx, planned, new Map());
 }
 
-function archiveAsset(vault: MemoryVault) {
-	const markdown = vault.contents.get('_OneNote archive.md');
-	assert.ok(typeof markdown === 'string');
-	const assets = parseFrontMatterBlock(markdown)?.frontMatter['onenote-assets'];
-	assert.ok(Array.isArray(assets));
-	assert.equal(assets.length, 1);
-	return assets[0] as { path: string, length: number, sha256: string };
-}
-
-test('the section archive owns every opaque binary through its asset manifest', async () => {
+test('page note write failure removes a newly created asset', async () => {
 	const { vault, subject } = await importer();
-	await writeArchive(subject, vault, [{ code: 'RAW', message: 'opaque', rawData: new Uint8Array([1, 2, 3]) }]);
+	const create = vault.create.bind(vault);
+	vault.create = async (path, data, options) => {
+		if (path.endsWith('/Page.md')) throw new Error('injected page write failure');
+		return await create(path, data, options);
+	};
+	const ctx = new ImportContext();
 
-	const asset = archiveAsset(vault);
-	assert.equal(asset.length, 3);
-	assert.match(asset.sha256, /^[0-9a-f]{64}$/);
-	assert.ok(vault.getAbstractFileByPath(asset.path));
-	assert.match(String(vault.contents.get('_OneNote archive.md')), new RegExp(`path="${asset.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`));
+	await writePages(subject, vault, ctx, [pageWithAssets(new Uint8Array([1, 2, 3]))]);
+
+	assert.equal(ctx.attachments, 0);
+	assert.equal(vault.getAbstractFileByPath('Page image.png'), null);
+	assert.ok(ctx.failed.includes('Page'));
 });
 
-test('reimport removes an unchanged archive binary that the source no longer contains', async () => {
+test('page note write failure retains a reused asset', async () => {
 	const { vault, subject } = await importer();
-	await writeArchive(subject, vault, [{ code: 'RAW', message: 'opaque', rawData: new Uint8Array([1, 2, 3]) }]);
-	const asset = archiveAsset(vault);
+	const bytes = new Uint8Array([1, 2, 3]);
+	await vault.createBinary('Page image.png', bytes.buffer);
+	const create = vault.create.bind(vault);
+	vault.create = async (path, data, options) => {
+		if (path.endsWith('/Page.md')) throw new Error('injected page write failure');
+		return await create(path, data, options);
+	};
+	const ctx = new ImportContext();
 
-	subject.indexImportedNotes();
-	await writeArchive(subject, vault, []);
+	await writePages(subject, vault, ctx, [pageWithAssets(bytes)]);
 
-	assert.equal(vault.getAbstractFileByPath(asset.path), null);
-});
-
-test('reimport retains stale archive binaries that were modified or are shared', async () => {
-	for (const reason of ['modified', 'shared'] as const) {
-		const { vault, subject } = await importer();
-		await writeArchive(subject, vault, [{ code: 'RAW', message: 'opaque', rawData: new Uint8Array([1, 2, 3]) }]);
-		const asset = archiveAsset(vault);
-		const file = vault.getAbstractFileByPath(asset.path) as unknown as TFile;
-
-		if (reason === 'modified') await vault.modifyBinary(file, new Uint8Array([9, 2, 3]).buffer);
-		else await vault.create('Other.md', serializeFrontMatter({ 'onenote-assets': [asset] }) + 'Still used here');
-
-		subject.indexImportedNotes();
-		await writeArchive(subject, vault, []);
-
-		assert.ok(vault.getAbstractFileByPath(asset.path), reason);
-	}
+	assert.equal(ctx.attachments, 0);
+	assert.ok(vault.getAbstractFileByPath('Page image.png'));
+	assert.deepEqual(new Uint8Array(await vault.readBinary({ path: 'Page image.png' })), bytes);
 });
 
 test('a truncated output filename keeps both complete names in Markdown', async () => {
@@ -128,8 +108,8 @@ test('a truncated output filename keeps both complete names in Markdown', async 
 		preservation: [],
 	};
 	const source = { path: 'C:/Notebook/Section.one', sha256: 'source-hash' };
-	const input = { section: { ...section([]), pages: [page] }, title: 'Section', groups: [], source };
-	const access = subject as PageAccess;
+	const input = { section: { ...section(), pages: [page] }, title: 'Section', groups: [], source };
+	const access = subject;
 	const [planned] = access.planSections([input], vault.root);
 
 	await access.importSection(new ImportContext(), planned, new Map());

@@ -245,6 +245,7 @@ export function memoryApp(vault: MemoryVault) {
 		fileManager: {
 			generateMarkdownLink: (file: { path: string }, _sourcePath: string, subpath?: string, display?: string) =>
 				`[[${file.path}${subpath ?? ''}${display ? `|${display}` : ''}]]`,
+			trashFile: async (file: { path: string }) => vault.remove(file.path),
 		},
 	} as never;
 }

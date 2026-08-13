@@ -59,6 +59,16 @@ export class ObjectSpaceMaterializer {
 		return undefined;
 	}
 
+	*currentSpacesByRootJcid(jcid: number): Iterable<MaterializedObjectSpace> {
+		for (const revisions of this.spaces.values()) {
+			const id = revisions[0].objectSpaceId!;
+			if (id.identifier === HEADER_CELL_OBJECT_SPACE_ID && id.value === 1) continue;
+
+			const space = this.tryGetSpace(id);
+			if (space?.getRoot(1)?.jcid === jcid) yield space;
+		}
+	}
+
 	tryGetSpace(id: ExtendedGuid, contextId?: ExtendedGuid): MaterializedObjectSpace | undefined {
 		const key = spaceKey(id, contextId);
 		if (this.cache.has(key)) return this.cache.get(key);
@@ -90,8 +100,24 @@ export class ObjectSpaceMaterializer {
 
 		const objects = new Map<string, RevisionStoreObject>();
 		const roots = new Map<number, ExtendedGuid>();
+		let chain = this.getRevisionChain(current);
+		if (!current.dependencyId && current.rootObjects.length === 0) {
+			let base: RevisionManifest | undefined;
+			let baseOrder = -1;
+			for (const revision of revisions) {
+				if (revision === current || revision.rootObjects.length === 0 || revision.isEncrypted) continue;
+				for (const association of revision.roleAssociations) {
+					if (association.role !== 1 || !contextEquals(association.contextId, contextId)) continue;
+					if (association.order < bestOrder && association.order >= baseOrder) {
+						baseOrder = association.order;
+						base = revision;
+					}
+				}
+			}
+			if (base) chain = [...this.getRevisionChain(base), current];
+		}
 
-		for (const revision of this.getRevisionChain(current)) {
+		for (const revision of chain) {
 			for (const declaration of this.objectsByRevision.get(keyOf(revision.id)) ?? []) {
 				objects.set(keyOf(declaration.id), declaration);
 			}

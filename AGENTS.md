@@ -2,6 +2,15 @@
 
 Read `CLAUDE.md` before changing code. It contains the repository-wide architecture, test, localization, and Obsidian review rules. This file adds rules for the local OneNote importer and its information-preservation guarantees.
 
+## Backup export workflow
+
+For multi-version local OneNote backup conversion, follow
+[`docs/onenote-backup-export.md`](docs/onenote-backup-export.md). Its backup
+export, attachment-recovery, link, XML, review-record, audit, and publication
+rules supersede the older preservation/archive guidance below when they
+conflict. The older rules remain applicable to the interactive importer and
+general parser work.
+
 ## Primary requirement
 
 For `.one`, `.onepkg`, and `.onex` imports, preserving information is more important than producing attractive Markdown. Never silently discard a page, object, property, attachment, title, path, link target, or parser failure merely because it cannot be represented cleanly.

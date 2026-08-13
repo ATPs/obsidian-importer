@@ -28,8 +28,8 @@ export interface CabinetLimits {
 }
 
 export const DEFAULT_CABINET_LIMITS: CabinetLimits = {
-	maxExpandedBytes: Number.MAX_SAFE_INTEGER,
-	maxEntryBytes: Number.MAX_SAFE_INTEGER,
+	maxExpandedBytes: 2 * 1024 * 1024 * 1024,
+	maxEntryBytes: 512 * 1024 * 1024,
 	maxEntries: 4096,
 };
 

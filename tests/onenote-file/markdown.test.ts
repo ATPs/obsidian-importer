@@ -51,9 +51,17 @@ test('a link wraps whatever emphasis the run already had', async () => {
 
 test('a OneNote page link becomes a link Obsidian can resolve after import', async () => {
 	const converted = await convertPage(page(para([{
-			text: 'the other page',
-			hyperlinkUrl: 'onenote:///C:/Notebook/Section.one#Other%20page&section-id={section}&page-id={page}&end',
-		}])), { saveAttachment: async () => null, resolveInternalLink: title => title });
+		text: 'the other page',
+		hyperlinkUrl: 'onenote:///C:/Notebook/Section.one#Other%20page&section-id={section}&page-id={page}&end',
+	}])), { saveAttachment: async () => null, resolveInternalLink: title => title });
+	assert.equal(converted.markdown, '[the other page](Other%20page)');
+});
+
+test('a double-encoded OneNote page title still resolves to its imported page', async () => {
+	const converted = await convertPage(page(para([{
+		text: 'the other page',
+		hyperlinkUrl: 'onenote:///C:/Notebook/Section.one#Other%2520page&section-id={section}&page-id={page}&end',
+	}])), { saveAttachment: async () => null, resolveInternalLink: title => title });
 	assert.equal(converted.markdown, '[the other page](Other%20page)');
 });
 
@@ -64,18 +72,16 @@ test('a malformed OneNote page title is kept rather than failing its page', asyn
 	assert.equal(converted.markdown, '[page](Bad%25escape)');
 });
 
-test('an unresolved OneNote page link keeps its stable source URL', async () => {
+test('an unresolved OneNote page link keeps only its visible text', async () => {
 	const url = 'onenote:///S.one#Duplicate&section-id={a}&page-id={b}';
 	const converted = await convertPage(page(para([{ text: 'page', hyperlinkUrl: url }])), {
 		saveAttachment: async () => null,
 		resolveInternalLink: () => undefined,
 	});
-	assert.equal(
-		converted.markdown,
-		'[page](onenote:///S.one#Duplicate&section-id=%7Ba%7D&page-id=%7Bb%7D) *(OneNote link target was not found in this import)*');
+	assert.equal(converted.markdown, 'page');
 });
 
-test('an ambiguous OneNote page link lists every imported candidate', async () => {
+test('an ambiguous OneNote page link keeps only its visible text', async () => {
 	const converted = await convertPage(page(para([{
 		text: 'duplicate page',
 		hyperlinkUrl: 'onenote:///S.one#Duplicate&section-id={a}',
@@ -84,9 +90,7 @@ test('an ambiguous OneNote page link lists every imported candidate', async () =
 		resolveInternalLink: () => ['Section A/Duplicate abc123', 'Section B/Duplicate def456'],
 	});
 
-	assert.equal(
-		converted.markdown,
-		'duplicate page *(OneNote link has multiple pages with this title: [1](Section%20A/Duplicate%20abc123), [2](Section%20B/Duplicate%20def456))*');
+	assert.equal(converted.markdown, 'duplicate page');
 });
 
 test('a run of only whitespace contributes no emphasis markers', async () => {
@@ -97,6 +101,22 @@ test('a style identifier becomes a heading', async () => {
 	assert.equal(await render(para('Title', { styleId: 'h1' })), '# Title');
 	assert.equal(await render(para('Deep', { styleId: 'h6' })), '###### Deep');
 	assert.equal(await render(para('Body', { styleId: 'p' })), 'Body');
+});
+
+test('a heading drops duplicate markers and OneMore top-of-page navigation', async () => {
+	const url = 'onenote:///S.one#Test&section-id={a}';
+	const converted = await convertPage(page(para([
+		{ text: '## ' },
+		{ text: 'results', bold: true },
+		{ text: ' [' },
+		{ text: 'Top of page', italic: true, hyperlinkUrl: url },
+		{ text: ']' },
+	], { styleId: 'h2' })), {
+		saveAttachment: async () => null,
+		resolveInternalLink: () => 'Test',
+	});
+
+	assert.equal(converted.markdown, '## **results**');
 });
 
 test('lists carry their bullet and their indent', async () => {
@@ -155,13 +175,13 @@ test('a ragged table is padded to its widest row', async () => {
 	assert.equal(markdown, ['| A |  |  |', '| --- | --- | --- |', '| 1 | 2 | 3 |'].join('\n'));
 });
 
-test('a pipe inside a cell is escaped rather than ending the cell', async () => {
+test('a non-code single-column table is expanded as ordinary content', async () => {
 	const markdown = await render({
 		kind: 'table',
 		rows: [{ cells: [{ children: [para('a | b')] }] }],
 	});
 
-	assert.ok(markdown.startsWith('| a \\| b |'), markdown);
+	assert.equal(markdown, 'a | b');
 });
 
 test('a table with no rows produces nothing at all', async () => {
@@ -349,6 +369,74 @@ test('a highlight carries the circle for its colour', async () => {
 	assert.equal(await render(para([{ text: 'both', highlight: '#ffff00', bold: true }])), '**==🟡both==**');
 });
 
+test('a neutral code background is not treated as semantic highlighting', async () => {
+	assert.equal(await render(para([{ text: 'plain', highlight: '#f2f2f2' }])), 'plain');
+});
+
+test('a long monospace assignment paragraph becomes fenced code', async () => {
+	const expression = 'df_result[\'keep\'] = (df_result[\'score\'] >= 0.95) & (~df_result[\'sample\'].isin(samples_to_remove)) & (df_result[\'count\'] > 10)';
+	assert.equal(
+		await render(para([{ text: expression, font: 'Consolas', highlight: '#f2f2f2' }])),
+		`\`\`\`\n${expression}\n\`\`\``);
+});
+
+test('a prose explanation that starts with an assignment remains prose', async () => {
+	const markdown = await render(para([{
+		text: 'min_log2FoldChange = 0.5, which means that the fold change is greater than one.',
+		font: 'Consolas',
+	}]));
+	assert.equal(markdown, 'min_log2FoldChange = 0.5, which means that the fold change is greater than one.');
+});
+
+test('an assignment explanation does not open a Python block before real code', async () => {
+	const markdown = await render(
+		para('min_log2FoldChange = 0.5, which means that the fold change is greater than one.'),
+		para('import pandas as pd'),
+		para('frame = pd.DataFrame()'));
+	assert.equal(markdown, ['min_log2FoldChange = 0.5, which means that the fold change is greater than one.', '', '```python', 'import pandas as pd', 'frame = pd.DataFrame()', '```'].join('\n'));
+});
+
+test('consecutive red syntax-highlighted config paragraphs become one clean code block', async () => {
+	const lines = [
+		'# config file',
+		'database_name =',
+		'decoy_search = 1',
+		'num_threads = 12',
+		'# masses',
+		'peptide_mass_tolerance = 10.00',
+		'[ENZYME_INFO]',
+		'1. Trypsin 1 KR P',
+	];
+	const elements = lines.flatMap((text, index) => [
+		para([{ text, highlight: '#ff0000' }]),
+		...(index === 3 ? [para('')] : []),
+	]);
+
+	assert.equal(await render(...elements), `\`\`\`\n${lines.slice(0, 4).join('\n')}\n\n${lines.slice(4).join('\n')}\n\`\`\``);
+});
+
+test('red config paragraphs in simple outlines still form one code block', async () => {
+	const line = (text: string): Element => ({ kind: 'outline', children: [para([{ text, highlight: '#ff0000' }])] });
+	const elements = [
+		line('# config'), line('database_name ='), line('decoy_search = 1'), line('num_threads = 12'),
+		line('# masses'), line('peptide_mass_tolerance = 10'), line('[ENZYME_INFO]'), line('1. Trypsin 1 KR P'),
+	];
+
+	assert.match(await render(...elements), /^```\n# config\n[\s\S]*\n```$/);
+});
+
+test('rendered red config lines separated by blank paragraphs are cleaned after conversion', async () => {
+	const values = ['# config', 'database_name =', 'decoy_search = 1', 'num_threads = 12', '# masses', 'peptide_mass_tolerance = 10', '[ENZYME_INFO]', '1. Trypsin 1 KR P'];
+	const elements: Element[] = values.map(value => ({
+		kind: 'outline',
+		children: [para([{ text: value, highlight: '#ff0000' }]), para('')],
+	}));
+	const converted = await convertPage(page(...elements), { saveAttachment: async () => null });
+
+	assert.doesNotMatch(converted.markdown, /==🔴/);
+	assert.match(converted.markdown, /^```\n# config\n[\s\S]*\n```$/);
+});
+
 test('a colour between two of them takes the nearer', async () => {
 	assert.equal(await render(para([{ text: 'amber', highlight: '#ffc000' }])), '==🟠amber==');
 	assert.equal(await render(para([{ text: 'lime', highlight: '#00ff00' }])), '==🟢lime==');
@@ -379,18 +467,400 @@ test('a table cell keeps the picture in it', async () => {
 	assert.deepEqual(saved, ['Test image.png']);
 });
 
-test('a table markdown cannot nest is reported rather than dropped', async () => {
-	const skipped: [string, string][] = [];
-
-	await convertPage(page({
+test('an empty single-cell wrapper preserves its nested table content', async () => {
+	const converted = await convertPage(page({
 		kind: 'table',
 		rows: [{ cells: [{ children: [{ kind: 'table', rows: [{ cells: [{ children: [para('inner')] }] }] }] }] }],
 	}), {
 		saveAttachment: async () => null,
-		onSkipped: (name, reason) => skipped.push([name, reason]),
 	});
 
-	assert.deepEqual(skipped, [['Test', 'not-representable']]);
+	assert.equal(converted.markdown, 'inner');
+	assert.equal(converted.htmlFallbacks, 0);
+});
+
+test('a single-cell wrapper around a two-column callout keeps the callout table', async () => {
+	const converted = await convertPage(page({
+		kind: 'table',
+		rows: [{ cells: [{ children: [{ kind: 'outline', children: [{
+			kind: 'table',
+			rows: [{ cells: [
+				{ children: [para('Information')] },
+				{ children: [para('Check the related page')] },
+			] }],
+		}] }] }] }],
+	}), { saveAttachment: async () => null });
+
+	assert.equal(converted.markdown, [
+		'| Information | Check the related page |',
+		'| --- | --- |',
+	].join('\n'));
+	assert.equal(converted.htmlFallbacks, 0);
+});
+
+test('a monospace single-cell table becomes a multiline code block', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [{ children: [
+			para([{ text: 'import pandas as pd', font: 'Consolas', bold: true }]),
+			para([{ text: 'print(pd.__version__)', font: 'Consolas' }]),
+		] }] }],
+	});
+
+	assert.equal(markdown, '```python\nimport pandas as pd\nprint(pd.__version__)\n```');
+});
+
+test('an unstyled single-cell table with high-confidence R syntax becomes code', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [{ children: [
+			para('library(tidyverse)'),
+			para('input <- read.csv("input.tsv", sep="\\t")'),
+			para('result <- input %>% group_by(sample) %>% summarise(count = n())'),
+			para('write.csv(result, "summary.csv", row.names = FALSE)'),
+		] }] }],
+	});
+
+	assert.equal(markdown, [
+		'```r',
+		'library(tidyverse)',
+		'input <- read.csv("input.tsv", sep="\\t")',
+		'result <- input %>% group_by(sample) %>% summarise(count = n())',
+		'write.csv(result, "summary.csv", row.names = FALSE)',
+		'```',
+	].join('\n'));
+});
+
+test('a VCF table remains raw VCF instead of becoming Markdown headings', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [{ children: [
+			para('##fileformat=VCFv4.1'),
+			para('##INFO=<ID=DP,Number=1,Type=Integer,Description="Read depth">'),
+			para('#CHROM POS ID REF ALT QUAL FILTER INFO'),
+			para('chr1 100 . A G 60 PASS DP=12'),
+		] }] }],
+	});
+
+	assert.equal(markdown, [
+		'```vcf',
+		'##fileformat=VCFv4.1',
+		'##INFO=<ID=DP,Number=1,Type=Integer,Description="Read depth">',
+		'#CHROM POS ID REF ALT QUAL FILTER INFO',
+		'chr1 100 . A G 60 PASS DP=12',
+		'```',
+	].join('\n'));
+});
+
+test('consecutive VCF paragraphs remain raw VCF instead of becoming Markdown headings', async () => {
+	const markdown = await render(
+		para('before'),
+		para('##fileformat=VCFv4.1'),
+		para('##INFO=<ID=DP,Number=1,Type=Integer,Description="Read depth">'),
+		para('#CHROM POS ID REF ALT QUAL FILTER INFO'),
+		para('chr1 100 . A G 60 PASS DP=12'),
+	);
+
+	assert.equal(markdown, [
+		'before',
+		'',
+		'```vcf',
+		'##fileformat=VCFv4.1',
+		'',
+		'##INFO=\\<ID=DP,Number=1,Type=Integer,Description="Read depth">',
+		'',
+		'#CHROM POS ID REF ALT QUAL FILTER INFO',
+		'',
+		'chr1 100 . A G 60 PASS DP=12',
+		'```',
+	].join('\n'));
+});
+
+test('a VCF wrapped in a non-simple outline remains raw VCF', async () => {
+	const wrapped = (text: string): Element => ({ kind: 'outline', children: [para(text), para('')] });
+	const converted = await convertPage(page(
+		wrapped('##fileformat=VCFv4.1'),
+		wrapped('##INFO=<ID=DP,Number=1,Type=Integer,Description="Read depth">'),
+		wrapped('#CHROM POS ID REF ALT QUAL FILTER INFO'),
+		wrapped('chr1 100 . A G 60 PASS DP=12'),
+	), { saveAttachment: async () => null });
+
+	assert.match(converted.markdown, /^```vcf\n##fileformat=VCFv4.1/m);
+	assert.match(converted.markdown, /chr1 100 \. A G 60 PASS DP=12\n```$/);
+});
+
+test('a long Python dictionary remains code rather than prose', async () => {
+	const value = `{'protein_description': 'ALL_1.p1', 'AA_seq': '${'MPEPTIDE'.repeat(20)}', 'source': 'analysis'}`;
+	const converted = await convertPage(page(para(value)), { saveAttachment: async () => null });
+	assert.equal(converted.markdown, `\`\`\`python\n${value}\n\`\`\``);
+});
+
+test('a long Python dictionary restores Markdown-escaped brackets inside code', async () => {
+	const value = `{'locations': \\[1, 2, 3\\], 'AA_seq': '${'MPEPTIDE'.repeat(20)}'}`;
+	const converted = await convertPage(page(para(value)), { saveAttachment: async () => null });
+	assert.equal(converted.markdown, `\`\`\`python\n${value.replaceAll('\\\\', '')}\n\`\`\``);
+});
+
+test('an ordinary short dictionary-like note remains prose', async () => {
+	assert.equal(await render(para("{'status': 'done'}")), "{'status': 'done'}");
+});
+
+test('a run of syntax-coloured Python paragraphs becomes runnable code', async () => {
+	const markdown = await render(
+		para([{ text: 'def', bold: true }, { text: ' count(items):' }]),
+		para([{ text: 'for', bold: true }, { text: ' item ' }, { text: 'in', bold: true }, { text: ' items:' }]),
+		para([{ text: 'return', bold: true }, { text: ' len(items)' }]));
+	assert.equal(markdown, ['```python', 'def count(items):', 'for item in items:', 'return len(items)', '```'].join('\n'));
+});
+
+test('a Python expression continues an established code block', async () => {
+	const markdown = await render(
+		para('import pandas as pd'),
+		para('frame = pd.DataFrame()'),
+		para('frame["count"] += 1'),
+		para('print(frame)'));
+	assert.equal(markdown, ['```python', 'import pandas as pd', 'frame = pd.DataFrame()', 'frame["count"] += 1', 'print(frame)', '```'].join('\n'));
+});
+
+test('R package setup stays in an R block', async () => {
+	const markdown = await render(
+		para('library("MatrixEQTL")'),
+		para('base.dir = find.package("MatrixEQTL")'),
+		para('output_file_name = tempfile()'));
+	assert.equal(markdown, ['```r', 'library("MatrixEQTL")', 'base.dir = find.package("MatrixEQTL")', 'output_file_name = tempfile()', '```'].join('\n'));
+});
+
+test('a sequence of shell commands becomes a bash block', async () => {
+	const markdown = await render(
+		para([{ text: 'cd ' }, { text: '/', bold: true }, { text: 'work' }]),
+		para([{ text: 'gatk --java-options "-Xmx4G" HaplotypeCaller --input sample.bam' }]),
+		para([{ text: 'samtools view -b sample.bam > sample.bam' }]));
+	assert.equal(markdown, ['```bash', 'cd /work', 'gatk --java-options "-Xmx4G" HaplotypeCaller --input sample.bam', 'samtools view -b sample.bam > sample.bam', '```'].join('\n'));
+});
+
+test('a long shell loop with fragmented bold formatting becomes a bash block', async () => {
+	const command = '**for** n **in** {1..18}**;** **do** python /work/run.py --sample ${n} --output /work/results/${n}**;** **done**';
+	assert.equal(await render(para(command)), '```bash\nfor n in {1..18}; do python /work/run.py --sample ${n} --output /work/results/${n}; done\n```');
+});
+
+test('plain text does not continue an established bash block', async () => {
+	const markdown = await render(para('cd /work'), para('wget https://example.test/data'), para('on another machine'));
+	assert.equal(markdown, ['```bash', 'cd /work', 'wget https://example.test/data', '```', 'on another machine'].join('\n'));
+});
+
+test('a dense GFF record sequence becomes a gff block', async () => {
+	const record = (feature: string, start: number) => `chr9 transdecoder ${feature} ${start} ${start + 50} . + . ID=ALL.p1.${feature}${start};Parent=ALL.p1`;
+	const markdown = await render(
+		para([{ text: 'chr9 transdecoder exon ' }, { text: '100', highlight: '#ffff00' }, { text: ' 150 . + . ID=ALL.p1.exon100;Parent=ALL.p1' }]),
+		para(record('CDS', 200)),
+		para(record('three_prime_UTR', 300)));
+	assert.equal(markdown, ['```gff', record('exon', 100), record('CDS', 200), record('three_prime_UTR', 300), '```'].join('\n'));
+});
+
+test('an unstyled single-cell table with high-confidence Python syntax becomes code', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [{ children: [
+			para('import pandas as pd'),
+			para('input_file = r"C:\\data\\input.tsv"'),
+			para('frame = pd.read_csv(input_file, sep="\\t")'),
+			para('frame.to_csv("summary.tsv", sep="\\t", index=False)'),
+		] }] }],
+	});
+
+	assert.equal(markdown, [
+		'```python',
+		'import pandas as pd',
+		'input_file = r"C:\\data\\input.tsv"',
+		'frame = pd.read_csv(input_file, sep="\\t")',
+		'frame.to_csv("summary.tsv", sep="\\t", index=False)',
+		'```',
+	].join('\n'));
+});
+
+test('ordinary prose in an unstyled single-cell table is not guessed as code', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [{ children: [
+			para('Import the data from the shared folder.'),
+			para('Read the results and check every sample.'),
+			para('Write a short summary for the next meeting.'),
+		] }] }],
+	});
+
+	assert.equal(markdown, [
+		'Import the data from the shared folder.',
+		'',
+		'Read the results and check every sample.',
+		'',
+		'Write a short summary for the next meeting.',
+	].join('\n'));
+});
+
+test('a table of contents wrapper is not guessed as code from heading markers', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [
+			{ cells: [{ children: [para('Table of Contents [Refresh]')] }] },
+			{ cells: [{ children: [para('# First section')] }] },
+			{ cells: [{ children: [para('# Second section')] }] },
+		],
+	});
+
+	assert.doesNotMatch(markdown, /^```/);
+	assert.match(markdown, /Table of Contents/);
+});
+
+test('a line-number column is removed from a code block', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [para([{ text: '1', font: 'Consolas' }]), para([{ text: '2', font: 'Consolas' }])] },
+			{ children: [para([{ text: 'library(tidyverse)', font: 'Consolas' }]), para([{ text: 'x <- 1', font: 'Consolas' }])] },
+		] }],
+	});
+
+	assert.equal(markdown, '```r\nlibrary(tidyverse)\nx <- 1\n```');
+});
+
+test('trailing blank code paragraphs do not break line-number detection', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [para('1'), para('2')] },
+			{ children: [para('echo first'), para('echo second'), para(''), para('')] },
+		] }],
+	});
+
+	assert.equal(markdown, '```\necho first\necho second\n```');
+});
+
+test('a small line-count discrepancy keeps high-confidence numbered code', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [para('1'), para('2'), para('3')] },
+			{ children: [para('import os'), para(''), para('print(os.getcwd())'), para('print("done")')] },
+		] }],
+	});
+
+	assert.equal(markdown, '```python\nimport os\n\nprint(os.getcwd())\nprint("done")\n```');
+});
+
+test('embedded line breaks count as separate code lines', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [para('1\n2\n3')] },
+			{ children: [para('import os\nprint(os.getcwd())\nprint("done")')] },
+		] }],
+	});
+
+	assert.equal(markdown, '```python\nimport os\nprint(os.getcwd())\nprint("done")\n```');
+});
+
+test('a structural code table survives missing font metadata', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [para('')] },
+			{ children: [para('cd /data/project'), para('for sample in *.fastq.gz; do'), para('\techo "$sample"'), para('done')] },
+		] }],
+	});
+
+	assert.equal(markdown, '```bash\ncd /data/project\nfor sample in *.fastq.gz; do\n\techo "$sample"\ndone\n```');
+});
+
+test('a one-row number and shell-command table becomes bash code', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [para('1')] },
+			{ children: [para('mapper.pl /data/reads.fa -d -p /data/genome.fa -o 48 -s reads.fa -t reads.arf')] },
+		] }],
+	});
+	assert.equal(markdown, '```bash\nmapper.pl /data/reads.fa -d -p /data/genome.fa -o 48 -s reads.fa -t reads.arf\n```');
+});
+
+test('an absolute-path mapper command in a one-row table becomes bash code', async () => {
+	const command = '/home/xcao/p/anaconda3/envs/bio/bin/mapper.pl /data/reads.fa -d -p /data/genome.fa -o 48 -s reads.fa -t reads.arf -v -j -l 18 -m';
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [{ children: [para('1'), para('')] }, { children: [para(command)] }] }],
+	});
+	assert.equal(markdown, `\`\`\`bash\n${command}\n\`\`\``);
+});
+
+test('a numbered GFM shell-command table is normalized to bash code', async () => {
+	const command = '/home/xcao/p/anaconda3/envs/bio/bin/mapper.pl /data/reads.fa -d -p /data/genome.fa -o 48 -s reads.fa -t reads.arf -v -j -l 18 -m';
+	const converted = await convertPage(page(para(`| 1 | ${command} |\n| --- | --- |`)), { saveAttachment: async () => null });
+	assert.equal(converted.markdown, `\`\`\`bash\n${command}\n\`\`\``);
+});
+
+test('a real nested two-dimensional table falls back to local HTML', async () => {
+	const converted = await convertPage(page({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [para('parent')] },
+			{ children: [{ kind: 'table', rows: [{ cells: [{ children: [para('child A')] }, { children: [para('child B')] }] }] }] },
+		] }],
+	}), { saveAttachment: async () => null });
+
+	assert.match(converted.markdown, /^<table>/);
+	assert.match(converted.markdown, /<table>.*child A.*child B.*<\/table>/s);
+	assert.equal(converted.htmlFallbacks, 1);
+});
+
+test('a deeply nested two-dimensional table stays as one local HTML structure', async () => {
+	const converted = await convertPage(page({
+		kind: 'table',
+		rows: [
+			{ cells: [
+				{ children: [{ kind: 'table', rows: [
+					{ cells: [{ children: [para('1')] }] },
+					{ cells: [{ children: [para('2')] }] },
+				] }] },
+				{ children: [para('3')] },
+			] },
+			{ cells: [{ children: [para('4')] }, { children: [para('5')] }] },
+			{ cells: [
+				{ children: [para('6')] },
+				{ children: [para('7'), { kind: 'table', rows: [
+					{ cells: [{ children: [para('ab')] }, { children: [para('cd')] }] },
+					{ cells: [
+						{ children: [para('ef')] },
+						{ children: [para('gh'), { kind: 'table', rows: [{ cells: [
+							{ children: [para('OK')] },
+							{ children: [para('OOKK')] },
+						] }] }] },
+					] },
+				] }] },
+			] },
+			{ cells: [{ children: [para('')] }, { children: [para('')] }] },
+			{ cells: [{ children: [para('888')] }, { children: [para('999')] }] },
+		],
+	}), { saveAttachment: async () => null });
+
+	assert.equal(converted.htmlFallbacks, 1);
+	assert.equal((converted.markdown.match(/<table>/g) ?? []).length, 4);
+	for (const value of ['1', '2', '3', '4', '5', '6', '7', 'ab', 'cd', 'ef', 'gh', 'OK', 'OOKK', '888', '999']) {
+		assert.match(converted.markdown, new RegExp(`>${value}<`));
+	}
+});
+
+test('HTML table fallback turns OneNote vertical tabs into line breaks', async () => {
+	const markdown = await render({
+		kind: 'table',
+		rows: [{ cells: [
+			{ children: [{ kind: 'table', rows: [{ cells: [
+				{ children: [para([{ text: 'before\u000bafter' }])] },
+				{ children: [para([{ text: 'right' }])] },
+			] }] }] },
+			{ children: [para([{ text: 'outer' }])] },
+		] }],
+	});
+	assert.match(markdown, /before<br>after/);
+	assert.doesNotMatch(markdown, /\u000b/);
 });
 
 test('text that looks like markdown is not read as markdown', async () => {
@@ -424,18 +894,47 @@ test('a link out of the notebook is left exactly as it was', async () => {
 		'[a file](file:///C:/notes.txt)');
 });
 
-test('a OneNote link with no page in it stays a link to OneNote', async () => {
-	const url = 'onenote:///C:/Notebook/Section.one';
-	assert.equal(await render(para([{ text: 'the section', hyperlinkUrl: url }])), `[the section](${url})`);
+test('a leaked Office hyperlink field becomes an ordinary external Markdown link', async () => {
+	const converted = await render(para('\uf7dfHYPERLINK "https://example.com/a b"visible text'));
+	assert.equal(converted, '[visible text](https://example.com/a%20b)');
 });
 
-test('the page name is taken from the fragment, not the identifiers after it', async () => {
+test('a private-use variant of a leaked Office hyperlink field is removed too', async () => {
+	const converted = await render(para('\ufdefHYPERLINK "https://example.com/a b"visible text'));
+	assert.equal(converted, '[visible text](https://example.com/a%20b)');
+});
+
+test('a leaked OneNote hyperlink field keeps only its visible text', async () => {
+	const converted = await render(para('\uf7dfHYPERLINK "onenote:#Other%20page&section-id={section}"visible text'));
+	assert.equal(converted, 'visible text');
+});
+
+test('literal formatted XML becomes a local XML code block', async () => {
+	const markdown = await render(
+		para('**\\<?xml** version="1.0"**?>**'),
+		para('**\\<settings>**'),
+		para('**\\<value>**x**\\</value>**'),
+		para('**\\</settings>**'),
+	);
+	assert.equal(markdown, '```\n<?xml version="1.0"?>\n\n<settings>\n\n<value>x</value>\n\n</settings>\n```');
+});
+
+test('a OneNote link with no page in it keeps only its visible text', async () => {
+	const url = 'onenote:///C:/Notebook/Section.one';
+	assert.equal(await render(para([{ text: 'the section', hyperlinkUrl: url }])), 'the section');
+});
+
+test('a OneMore navigation link keeps only its visible text', async () => {
+	assert.equal(await render(para([{ text: 'Refresh', hyperlinkUrl: 'onemore://InsertTocCommand/refresh/links/style0' }])), 'Refresh');
+});
+
+test('an unresolvable page name does not retain a OneNote URL', async () => {
 	assert.equal(
 		await render(para([{
 			text: 'page',
 			hyperlinkUrl: 'onenote:https://d.docs.live.net/x/Nb/S.one#Q4%20review&section-id={a}&page-id={b}&end',
 		}])),
-		'[page](Q4%20review)');
+		'page');
 });
 
 test('the importer decides what an internal link points at', async () => {

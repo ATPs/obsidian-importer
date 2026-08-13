@@ -104,6 +104,15 @@ export function mapSection(store: RevisionStore, options: ReaderOptions = DEFAUL
 		}
 	}
 
+	// Some desktop backups commit a page revision before updating the section's
+	// page-series references. Recover only current, non-deleted page spaces; the
+	// visited set prevents duplicates with normally referenced pages.
+	for (const pageSpace of materializer.currentSpacesByRootJcid(Jcid.pageManifestNode)) {
+		if (!pageSpace.revision.objectSpaceId) continue;
+		const page = mapPage(materializer, pageSpace.revision.objectSpaceId, options, visitedPages, section.preservation);
+		if (page && !page.isDeleted) section.pages.push(page);
+	}
+
 	for (const object of sectionSpace.objects()) {
 		if (object.diagnostic) section.preservation.push(recordFor(object, object.diagnostic.code, object.diagnostic.message));
 		preserveUnhandledProperties(section.preservation, object);
@@ -373,7 +382,7 @@ function buildParagraph(space: MaterializedObjectSpace, item: RevisionStoreObjec
 }
 
 /** Finds Word HYPERLINK fields embedded in text. */
-const HYPERLINK_FIELD = /﷟\s*HYPERLINK\s+"([^"]*)"\s*/;
+const HYPERLINK_FIELD = /﷟\s*HYPERLINK\s+"([^"]*)"/;
 
 function liftHyperlinkFields(runs: TextRun[]): void {
 	let pending: string | undefined;

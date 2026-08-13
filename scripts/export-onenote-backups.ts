@@ -18,7 +18,6 @@ interface MissingAsset {
 	name: string;
 	label: string;
 	embed: boolean;
-	record: string;
 }
 
 interface PageNote {
@@ -39,7 +38,6 @@ interface SourceVersion {
 	stage: string;
 	report: LocalConversionReport;
 	pages: PageNote[];
-	archive?: PageNote;
 }
 
 interface PageGroup {
@@ -49,6 +47,12 @@ interface PageGroup {
 interface CopiedAsset {
 	asset: Asset;
 	markdownPath: string;
+}
+
+interface PlannedPage {
+	selected: PageNote;
+	candidates: PageNote[];
+	target: string;
 }
 
 interface NotebookReport {
@@ -90,6 +94,17 @@ export function sectionNameFromBackupFile(file: string): string {
 
 function normalized(value: string): string {
 	return value.normalize('NFC').trim().toLocaleLowerCase();
+}
+
+function titleKeys(value: string): string[] {
+	const title = normalized(value).replace(/\s+/gu, ' ');
+	return [`title:${title}`];
+}
+
+function titleMatches(value: string, targets: Map<string, string[]>): Set<string> {
+	const keys = titleKeys(value);
+	const exact = targets.get(keys[0]) ?? [];
+	return new Set(exact.length > 0 ? exact : keys.slice(1).flatMap(key => targets.get(key) ?? []));
 }
 
 function pageFallbackKey(note: PageNote): string | undefined {
@@ -138,28 +153,23 @@ function stageAsset(note: PageNote, asset: Asset): string | undefined {
 	return within(note.version.stage, target) && fs.existsSync(target) ? target : undefined;
 }
 
-function xmlUnescape(value: string): string {
-	return value.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+export function readMissingAssets(frontMatter: Record<string, unknown>): MissingAsset[] {
+	const raw = frontMatter['onenote-missing-assets'];
+	if (!Array.isArray(raw)) return [];
+	return raw.flatMap(value => {
+		if (!value || typeof value !== 'object') return [];
+		const candidate = value as Partial<MissingAsset>;
+		return typeof candidate.name === 'string'
+			&& typeof candidate.label === 'string'
+			&& typeof candidate.embed === 'boolean'
+			? [{ name: candidate.name, label: candidate.label, embed: candidate.embed }]
+			: [];
+	});
 }
 
-function detail(record: string, name: string): string | undefined {
-	const expression = new RegExp(`<detail name="${name}" value="([\\s\\S]*?)"\\/>`);
-	const match = expression.exec(record);
-	return match ? xmlUnescape(match[1]) : undefined;
-}
-
-function missingAssets(body: string): MissingAsset[] {
-	const result: MissingAsset[] = [];
-	for (const match of body.matchAll(/<record code="ONENOTE_ASSET_DATA_MISSING">([\s\S]*?)<\/record>/g)) {
-		const record = match[0];
-		const name = detail(record, 'name');
-		const label = detail(record, 'label');
-		const embed = detail(record, 'embed');
-		if (name !== undefined && label !== undefined && embed !== undefined) {
-			result.push({ name, label, embed: embed === 'true', record });
-		}
-	}
-	return result;
+export function writeMissingAssets(frontMatter: Record<string, unknown>, missing: MissingAsset[]): void {
+	if (missing.length > 0) frontMatter['onenote-missing-assets'] = missing;
+	else delete frontMatter['onenote-missing-assets'];
 }
 
 function assetBaseName(asset: Asset): string {
@@ -169,22 +179,55 @@ function assetBaseName(asset: Asset): string {
 	return base.replace(/ (\d+)$/, '') + extension;
 }
 
-function linkTargetForAsset(body: string, asset: Asset): { label: string, embed: boolean } | undefined {
+export function linkTargetForAsset(body: string, asset: Asset): { label: string, embed: boolean } | undefined {
 	const encoded = encodeURI(asset.path);
 	const at = body.indexOf(encoded);
 	if (at < 0) return undefined;
 
-	// Source folder names can contain parentheses, which are legal inside an
-	// encoded Markdown destination but defeat a simplistic `...)` regex.
-	const image = body.lastIndexOf('![', at);
-	const link = body.lastIndexOf('[', at);
-	const opening = image >= 0 && image + 1 === link ? image : link;
+	// Anchor on the destination's own `](`. OCR labels can contain unescaped
+	// brackets, so searching backwards for the nearest `[` selects the wrong
+	// boundary for labels such as "gene [source:HGNC ...".
+	const labelEnd = body.lastIndexOf('](', at);
+	if (labelEnd < 0) return undefined;
+	const image = body.lastIndexOf('![', labelEnd);
+	const link = body.lastIndexOf('[', labelEnd);
+	const embed = image >= 0 && body.indexOf('](', image + 2) === labelEnd;
+	const opening = embed ? image : link;
 	if (opening < 0) return undefined;
-	const embed = opening === image;
 	const labelStart = opening + (embed ? 2 : 1);
-	const labelEnd = body.indexOf('](', labelStart);
-	if (labelEnd < labelStart || labelEnd > at) return undefined;
 	return { label: body.slice(labelStart, labelEnd), embed };
+}
+
+/**
+ * OCR labels can differ only because a prior conversion fenced short code
+ * fragments inside an image label. Keep this deliberately strict: it is only
+ * used after the same-page/name/embed checks below have already succeeded.
+ */
+export function sameAttachmentLabel(left: string, right: string): boolean {
+	const normalize = (value: string) => value
+		.replace(/^```[^\r\n]*\r?\n|^```\s*$/gmu, '')
+		.replace(/\s+/gu, ' ')
+		.trim()
+		.toLocaleLowerCase();
+	const first = normalize(left);
+	const second = normalize(right);
+	if (first === second) return true;
+	if (first.length < 120 || second.length < 120 || first.length > 12_000 || second.length > 12_000) return false;
+	const previous = Array.from({ length: second.length + 1 }, (_, index) => index);
+	for (let row = 1; row <= first.length; row++) {
+		let diagonal = previous[0];
+		previous[0] = row;
+		for (let column = 1; column <= second.length; column++) {
+			const above = previous[column];
+			previous[column] = Math.min(
+				previous[column] + 1,
+				previous[column - 1] + 1,
+				diagonal + Number(first[row - 1] !== second[column - 1]),
+			);
+			diagonal = above;
+		}
+	}
+	return previous[second.length] <= Math.max(3, Math.floor(Math.max(first.length, second.length) * 0.06));
 }
 
 function sourceAssetForMissing(note: PageNote, missing: MissingAsset, used: Set<string>): Asset | undefined {
@@ -192,7 +235,7 @@ function sourceAssetForMissing(note: PageNote, missing: MissingAsset, used: Set<
 		const key = `${note.file}\u0000${asset.path}`;
 		if (used.has(key) || assetBaseName(asset) !== missing.name) continue;
 		const link = linkTargetForAsset(note.body, asset);
-		if (!link || link.embed !== missing.embed || link.label !== missing.label) continue;
+		if (!link || link.embed !== missing.embed || !sameAttachmentLabel(link.label, missing.label)) continue;
 		if (!stageAsset(note, asset)) continue;
 		used.add(key);
 		return asset;
@@ -249,10 +292,6 @@ function appendRecoveredLinks(body: string, links: string[]): string {
 	return `${body.trimEnd()}\n\n## Recovered OneNote attachments\n\n${links.join('\n\n')}\n`;
 }
 
-function removeRecoveredMissingRecord(body: string, missing: MissingAsset): string {
-	return body.replace(missing.record, '');
-}
-
 function targetRelative(note: PageNote): string {
 	const relative = posix(path.relative(note.version.stage, note.file));
 	const [section, ...rest] = relative.split('/');
@@ -285,8 +324,7 @@ function readVersion(notebook: string, source: string, stage: string, report: Lo
 		const parsed = parseFrontMatterBlock(fs.readFileSync(file, 'utf8'));
 		if (!parsed) continue;
 		const note: PageNote = { file, relative: posix(path.relative(stage, file)), frontMatter: parsed.frontMatter, body: parsed.body, version };
-		if (path.basename(file).toLowerCase() === '_onenote archive.md') version.archive = note;
-		else if (pageId(note)) version.pages.push(note);
+		if (path.basename(file).toLowerCase() !== '_onenote archive.md' && pageId(note)) version.pages.push(note);
 	}
 
 	version.sectionId = typeof version.pages[0]?.frontMatter['onenote-section-id'] === 'string'
@@ -387,6 +425,122 @@ function markdownLink(missing: MissingAsset, target: string): string {
 	return missing.embed ? `![${missing.label}](${encodeURI(target)})` : `[${missing.label}](${encodeURI(target)})`;
 }
 
+function linkKey(value: string): string | undefined {
+	let decoded: string;
+	try {
+		decoded = decodeURI(value);
+	}
+	catch {
+		return undefined;
+	}
+	decoded = posix(decoded).replace(/^\.\//, '').replace(/^\//, '').replace(/\.md$/iu, '');
+	const parts = decoded.split('/');
+	if (parts.some(part => part === '..')) return undefined;
+	return normalized(parts.join('/'));
+}
+
+function splitLinkDestination(destination: string): { path: string, suffix: string } {
+	const at = destination.search(/[?#]/);
+	return at < 0 ? { path: destination, suffix: '' } : { path: destination.slice(0, at), suffix: destination.slice(at) };
+}
+
+function oneNoteTitle(destination: string): string | undefined {
+	if (!destination.toLowerCase().startsWith('onenote:')) return undefined;
+	const hash = destination.indexOf('#');
+	if (hash < 0) return undefined;
+	const tail = destination.slice(hash + 1);
+	const encoded = tail.slice(0, tail.indexOf('&') < 0 ? tail.length : tail.indexOf('&'));
+	try {
+		let decoded = decodeURIComponent(encoded);
+		if (/%[0-9a-f]{2}/i.test(decoded)) decoded = decodeURIComponent(decoded);
+		return decoded;
+	}
+	catch {
+		return undefined;
+	}
+}
+
+function visibleLinkText(label: string, fallback: string): string {
+	const visible = label.replace(/^!?\[/u, '').replace(/\]$/u, '').trim();
+	return visible || fallback;
+}
+
+/** Rewrites only uniquely indexed local note links; external and unresolved links remain byte-for-byte unchanged. */
+export function rewriteFinalLinks(
+	body: string,
+	sourceRelative: string,
+	finalRelative: string,
+	targets: Map<string, string[]>,
+	crossNotebook: 'link' | 'title' = 'link',
+): string {
+	const fieldsRewritten = body.replace(/\uf7df?HYPERLINK "(onenote:[^"]+)"([^\r\n|]*)/giu, (whole, destination: string, visible: string) => {
+		const linkedTitle = oneNoteTitle(destination);
+		if (!linkedTitle) return whole;
+		const matches = titleMatches(linkedTitle, targets);
+		if (matches.size !== 1) return visible.trim() || linkedTitle;
+		const [target] = matches;
+		if (crossNotebook === 'title' && notebookComponent(finalRelative) !== notebookComponent(target)) return visible.trim() || linkedTitle;
+		const rewritten = relativeFinalLink(finalRelative, target);
+		const label = visible.trim() || linkedTitle;
+		return `[${label}](${encodeURI(rewritten)})`;
+	});
+
+	return fieldsRewritten.replace(/(!?\[(?:\\.|[^\\\]\r\n])*\])\(((?:[^\s<>()]|\([^()\r\n]*\))+)(\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\)(?: \*\(OneNote link target was not found in this import\)\*)?/g, (whole, label: string, destination: string, title = '') => {
+		const linkedTitle = oneNoteTitle(destination);
+		if (linkedTitle) {
+			const matches = titleMatches(linkedTitle, targets);
+			if (matches.size !== 1) return visibleLinkText(label, linkedTitle);
+			const [target] = matches;
+			if (crossNotebook === 'title' && notebookComponent(finalRelative) !== notebookComponent(target)) return visibleLinkText(label, linkedTitle);
+			const rewritten = relativeFinalLink(finalRelative, target);
+			return `${label}(${encodeURI(rewritten)}${title})`;
+		}
+		if (destination.startsWith('#') || /^[a-z][a-z\d+.-]*:/iu.test(destination)) return whole;
+		const { path: destinationPath, suffix } = splitLinkDestination(destination);
+		const direct = linkKey(destinationPath);
+		const relative = linkKey(posix(path.posix.join(path.posix.dirname(sourceRelative), destinationPath)));
+		const matches = new Set([...(direct ? targets.get(direct) ?? [] : []), ...(relative ? targets.get(relative) ?? [] : [])]);
+		if (matches.size !== 1) return whole;
+		const [target] = matches;
+		const rewritten = relativeFinalLink(finalRelative, target);
+		return `${label}(${encodeURI(rewritten)}${suffix}${title})`;
+	});
+}
+
+function notebookComponent(relative: string): string {
+	return posix(relative).split('/')[0] ?? '';
+}
+
+function relativeFinalLink(finalRelative: string, target: string): string {
+	let rewritten = posix(path.posix.relative(path.posix.dirname(finalRelative), target)).replace(/\.md$/iu, '');
+	if (!rewritten.startsWith('.')) rewritten = `./${rewritten}`;
+	return rewritten;
+}
+
+function finalLinkIndex(plans: PlannedPage[], buildRoot: string): Map<string, string[]> {
+	const index = new Map<string, string[]>();
+	for (const plan of plans) {
+		const finalRelative = posix(path.relative(buildRoot, plan.target));
+		const titleCandidates = [plan.selected.frontMatter.title, path.basename(plan.target, path.extname(plan.target))];
+		for (const title of titleCandidates) {
+			if (typeof title !== 'string' || title === '') continue;
+			for (const key of titleKeys(title)) {
+				const matches = index.get(key) ?? [];
+				if (!matches.includes(finalRelative)) matches.push(finalRelative);
+				index.set(key, matches);
+			}
+		}
+		for (const candidate of plan.candidates) {
+			const key = linkKey(candidate.relative);
+			if (!key) continue;
+			const matches = index.get(key) ?? [];
+			if (!matches.includes(finalRelative)) matches.push(finalRelative);
+			index.set(key, matches);
+		}
+	}
+	return index;
+}
+
 function writePage(
 	selected: PageNote,
 	candidates: PageNote[],
@@ -397,6 +551,8 @@ function writePage(
 	let body = selected.body;
 	const frontMatter = { ...selected.frontMatter };
 	const copied: Asset[] = [];
+	const missing = readMissingAssets(frontMatter);
+	const remainingMissing: MissingAsset[] = [];
 	for (const asset of readAssets(frontMatter)) {
 		const result = copyAsset(selected, asset, target, buildRoot);
 		if (!result) {
@@ -411,29 +567,30 @@ function writePage(
 	const recoveredLinks: string[] = [];
 	let recovered = 0;
 	let unrecovered = 0;
-	for (const missing of missingAssets(body)) {
+	for (const missingAsset of missing) {
 		const older = candidates
 			.filter(candidate => candidate !== selected)
 			.sort((left, right) => right.version.backupMtimeMs - left.version.backupMtimeMs);
 		let result: CopiedAsset | undefined;
 		for (const candidate of older) {
-			const source = sourceAssetForMissing(candidate, missing, used);
+			const source = sourceAssetForMissing(candidate, missingAsset, used);
 			if (!source) continue;
 			result = copyAsset(candidate, source, target, buildRoot);
 			if (result) break;
 		}
 		if (!result) {
 			unrecovered++;
-			issues.push(`${selected.file}: could not recover missing ${missing.name}`);
+			remainingMissing.push(missingAsset);
+			issues.push(`${selected.file}: could not recover missing ${missingAsset.name}`);
 			continue;
 		}
 		copied.push(result.asset);
-		recoveredLinks.push(markdownLink(missing, result.markdownPath));
-		body = removeRecoveredMissingRecord(body, missing);
+		recoveredLinks.push(markdownLink(missingAsset, result.markdownPath));
 		recovered++;
 	}
 
 	frontMatter['onenote-assets'] = copied;
+	writeMissingAssets(frontMatter, remainingMissing);
 	frontMatter['onenote-completeness'] = unrecovered > 0 ? 'degraded' : recovered > 0 ? 'recovered' : frontMatter['onenote-completeness'];
 	frontMatter['onenote-merged-from'] = selected.version.source;
 	frontMatter['onenote-recovered-assets'] = recovered;
@@ -441,25 +598,6 @@ function writePage(
 	fs.mkdirSync(path.dirname(target), { recursive: true });
 	fs.writeFileSync(target, serializeFrontMatter(frontMatter) + body, 'utf8');
 	return { recovered, unrecovered };
-}
-
-function writeArchive(source: PageNote, target: string, buildRoot: string, issues: string[]): void {
-	const frontMatter = { ...source.frontMatter };
-	let body = source.body;
-	const copied: Asset[] = [];
-	for (const asset of readAssets(frontMatter)) {
-		const result = copyAsset(source, asset, target, buildRoot);
-		if (!result) {
-			issues.push(`${source.file}: archive asset unavailable or failed integrity check: ${asset.path}`);
-			continue;
-		}
-		copied.push(result.asset);
-		body = replaceAssetPath(body, asset.path, result.markdownPath);
-	}
-	frontMatter['onenote-assets'] = copied;
-	frontMatter['onenote-merged-from'] = source.version.source;
-	fs.mkdirSync(path.dirname(target), { recursive: true });
-	fs.writeFileSync(target, serializeFrontMatter(frontMatter) + body, 'utf8');
 }
 
 function auditBuild(root: string): string[] {
@@ -488,6 +626,41 @@ function auditBuild(root: string): string[] {
 		}
 	}
 	return errors;
+}
+
+function rewriteGlobalOneNoteLinks(outputRoot: string, notebookNames: string[]): void {
+	const markdown: string[] = [];
+	const walk = (directory: string): void => {
+		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+			const item = path.join(directory, entry.name);
+			if (entry.isDirectory()) walk(item);
+			else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) markdown.push(item);
+		}
+	};
+	for (const notebook of notebookNames) walk(path.join(outputRoot, notebook));
+
+	const index = new Map<string, string[]>();
+	for (const file of markdown) {
+		const parsed = parseFrontMatterBlock(fs.readFileSync(file, 'utf8'));
+		if (!parsed) continue;
+		const relative = posix(path.relative(outputRoot, file));
+		for (const title of [parsed.frontMatter.title, path.basename(file, path.extname(file))]) {
+			if (typeof title !== 'string' || title === '') continue;
+			for (const key of titleKeys(title)) {
+				const matches = index.get(key) ?? [];
+				if (!matches.includes(relative)) matches.push(relative);
+				index.set(key, matches);
+			}
+		}
+	}
+
+	for (const file of markdown) {
+		const parsed = parseFrontMatterBlock(fs.readFileSync(file, 'utf8'));
+		if (!parsed) continue;
+		const relative = posix(path.relative(outputRoot, file));
+		const rewritten = rewriteFinalLinks(parsed.body, relative.replace(/\.md$/iu, ''), relative, index, 'title');
+		if (rewritten !== parsed.body) fs.writeFileSync(file, serializeFrontMatter(parsed.frontMatter) + rewritten, 'utf8');
+	}
 }
 
 function inputFiles(directory: string): string[] {
@@ -547,6 +720,7 @@ export async function exportOneNoteBackups(outputArgument: string, inputArgument
 			issues: [],
 		};
 		fs.mkdirSync(build, { recursive: false });
+		const plans: PlannedPage[] = [];
 
 		for (const section of connectedSections(versions)) {
 			const newest = [...section].sort((left, right) => right.backupMtimeMs - left.backupMtimeMs || right.source.localeCompare(left.source))[0];
@@ -565,15 +739,27 @@ export async function exportOneNoteBackups(outputArgument: string, inputArgument
 				}
 				const selected = selectedPage(group);
 				const target = path.join(sectionRoot, ...targetRelative(selected).split('/'));
-				const outcome = writePage(selected, group.candidates, target, build, report.issues);
-				recoveredAssets += outcome.recovered;
-				unrecoveredAssets += outcome.unrecovered;
+				plans.push({ selected, candidates: group.candidates, target });
 				pages++;
 			}
-			const archive = [...section].map(version => version.archive).filter((note): note is PageNote => note !== undefined)
-				.sort((left, right) => right.version.backupMtimeMs - left.version.backupMtimeMs)[0];
-			if (archive) writeArchive(archive, path.join(sectionRoot, '_OneNote archive.md'), build, report.issues);
 			report.sections.push({ name: sectionName, pages, recoveredAssets, unrecoveredAssets, skippedOlderOnlyPages });
+		}
+
+		const links = finalLinkIndex(plans, build);
+		for (const plan of plans) {
+			const section = report.sections.find(candidate => within(path.join(build, candidate.name), plan.target));
+			const outcome = writePage(plan.selected, plan.candidates, plan.target, build, report.issues);
+			if (section) {
+				section.recoveredAssets += outcome.recovered;
+				section.unrecoveredAssets += outcome.unrecovered;
+			}
+			const content = fs.readFileSync(plan.target, 'utf8');
+			const parsed = parseFrontMatterBlock(content);
+			if (!parsed) throw new Error(`Generated note has invalid frontmatter: ${plan.target}`);
+			const sourceRelative = plan.selected.relative.replace(/\.md$/iu, '');
+			const finalRelative = posix(path.relative(build, plan.target));
+			const rewritten = rewriteFinalLinks(parsed.body, sourceRelative, finalRelative, links);
+			fs.writeFileSync(plan.target, serializeFrontMatter(parsed.frontMatter) + rewritten, 'utf8');
 		}
 
 		const auditErrors = auditBuild(build);
@@ -586,6 +772,11 @@ export async function exportOneNoteBackups(outputArgument: string, inputArgument
 		}
 		fs.renameSync(build, final);
 		reports.push(report);
+	}
+	rewriteGlobalOneNoteLinks(outputRoot, notebookNames);
+	for (const notebook of notebookNames) {
+		const auditErrors = auditBuild(path.join(outputRoot, notebook));
+		if (auditErrors.length > 0) throw new Error(`Refusing to publish global links for ${notebook}; ${auditErrors.join('\n')}`);
 	}
 
 	fs.writeFileSync(path.join(outputRoot, '_merge-report.json'), JSON.stringify(reports, null, 2), 'utf8');
