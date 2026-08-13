@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { convertOneNoteLocal } from '../../scripts/convert-onenote-local';
-import { exportOneNoteBackups, linkTargetForAsset, readMissingAssets, rewriteFinalLinks, sameAttachmentLabel, writeMissingAssets } from '../../scripts/export-onenote-backups';
+import { attachmentIdentityMatches, exportOneNoteBackups, linkTargetForAsset, readMissingAssets, rewriteFinalLinks, sameAttachmentLabel, writeMissingAssets } from '../../scripts/export-onenote-backups';
 
 const fixture = path.join(__dirname, 'fixtures', 'testOneNote.one');
 
@@ -29,10 +29,10 @@ test('local OneNote export puts attachments beside the note in attachments', asy
 test('backup merge reads structured missing assets and ignores malformed entries', () => {
 	assert.deepEqual(readMissingAssets({
 		'onenote-missing-assets': [
-			{ name: 'diagram.emf', label: 'diagram', embed: true },
+			{ name: 'diagram.emf', label: 'diagram', embed: true, sourceName: 'Untitled picture.png', ordinal: 2 },
 			{ name: 'missing-label.bin', embed: false },
 		],
-	}), [{ name: 'diagram.emf', label: 'diagram', embed: true }]);
+	}), [{ name: 'diagram.emf', label: 'diagram', embed: true, sourceName: 'Untitled picture.png', ordinal: 2 }]);
 });
 
 test('backup merge matches an OCR attachment label despite generated code fences', () => {
@@ -40,6 +40,22 @@ test('backup merge matches an OCR attachment label despite generated code fences
 	const older = 'De novo variants tend to enrich\nCoding\n```python\np=O.14\nRR=I .57\n```\nLGD\nTD Male';
 	assert.equal(sameAttachmentLabel(current, older), true);
 	assert.equal(sameAttachmentLabel(current, 'Architecture of Chromosome X\nPAR1\nPAR2\nCentromere'), false);
+});
+
+test('backup merge uses source identity instead of visible OCR labels when available', () => {
+	const missing = { name: 'page image.png', label: 'removed OCR', embed: true, sourceName: 'Untitled picture.png', ordinal: 1 };
+	assert.equal(attachmentIdentityMatches(
+		{ path: 'Section/attachments/page image 1.png', length: 1, sha256: 'hash', sourceName: 'Untitled picture.png', ordinal: 1, embed: true },
+		missing), true);
+	assert.equal(attachmentIdentityMatches(
+		{ path: 'Section/attachments/page image 2.png', length: 1, sha256: 'hash', sourceName: 'Untitled picture.png', ordinal: 2 },
+		missing), false);
+	assert.equal(attachmentIdentityMatches(
+		{ path: 'Section/attachments/page image.png', length: 1, sha256: 'hash' },
+		missing), false);
+	assert.equal(attachmentIdentityMatches(
+		{ path: 'Section/attachments/page file.png', length: 1, sha256: 'hash', sourceName: 'Untitled picture.png', ordinal: 1, embed: false },
+		missing), false);
 });
 
 test('backup merge removes the missing asset field after recovery and keeps unrecovered entries', () => {

@@ -12,12 +12,22 @@ interface Asset {
 	path: string;
 	length: number;
 	sha256: string;
+	/** Stable source-image name, retained for older-backup recovery. */
+	sourceName?: string;
+	/** Zero-based occurrence of this source name within its page. */
+	ordinal?: number;
+	/** Whether the source rendered as an image rather than a file link. */
+	embed?: boolean;
 }
 
 interface MissingAsset {
 	name: string;
 	label: string;
 	embed: boolean;
+	/** Present on new conversions; never derived from a Markdown label. */
+	sourceName?: string;
+	/** Present with sourceName to distinguish same-name attachments. */
+	ordinal?: number;
 }
 
 interface PageNote {
@@ -138,7 +148,16 @@ function readAssets(frontMatter: Record<string, unknown>): Asset[] {
 		if (!value || typeof value !== 'object') return [];
 		const candidate = value as Partial<Asset>;
 		return typeof candidate.path === 'string' && typeof candidate.length === 'number' && typeof candidate.sha256 === 'string'
-			? [{ path: posix(candidate.path), length: candidate.length, sha256: candidate.sha256 }]
+			? [{
+				path: posix(candidate.path),
+				length: candidate.length,
+				sha256: candidate.sha256,
+				sourceName: typeof candidate.sourceName === 'string' ? candidate.sourceName : undefined,
+				ordinal: typeof candidate.ordinal === 'number' && Number.isInteger(candidate.ordinal) && candidate.ordinal >= 0
+					? candidate.ordinal
+					: undefined,
+				embed: typeof candidate.embed === 'boolean' ? candidate.embed : undefined,
+			}]
 			: [];
 	});
 }
@@ -162,7 +181,15 @@ export function readMissingAssets(frontMatter: Record<string, unknown>): Missing
 		return typeof candidate.name === 'string'
 			&& typeof candidate.label === 'string'
 			&& typeof candidate.embed === 'boolean'
-			? [{ name: candidate.name, label: candidate.label, embed: candidate.embed }]
+			? [{
+				name: candidate.name,
+				label: candidate.label,
+				embed: candidate.embed,
+				sourceName: typeof candidate.sourceName === 'string' ? candidate.sourceName : undefined,
+				ordinal: typeof candidate.ordinal === 'number' && Number.isInteger(candidate.ordinal) && candidate.ordinal >= 0
+					? candidate.ordinal
+					: undefined,
+			}]
 			: [];
 	});
 }
@@ -230,17 +257,40 @@ export function sameAttachmentLabel(left: string, right: string): boolean {
 	return previous[second.length] <= Math.max(3, Math.floor(Math.max(first.length, second.length) * 0.06));
 }
 
+/**
+ * New conversions use source identity rather than rendered labels. Old staged
+ * notes have neither field and retain the compatibility matcher below.
+ */
+export function attachmentIdentityMatches(asset: Asset, missing: MissingAsset): boolean {
+	const identified = missing.sourceName !== undefined || missing.ordinal !== undefined || asset.sourceName !== undefined || asset.ordinal !== undefined;
+	return identified
+		? missing.sourceName === asset.sourceName
+			&& missing.ordinal === asset.ordinal
+			&& (asset.embed === undefined || missing.embed === asset.embed)
+		: assetBaseName(asset) === missing.name;
+}
+
 function sourceAssetForMissing(note: PageNote, missing: MissingAsset, used: Set<string>): Asset | undefined {
-	for (const asset of readAssets(note.frontMatter)) {
+	const candidates = readAssets(note.frontMatter).filter(asset => {
 		const key = `${note.file}\u0000${asset.path}`;
-		if (used.has(key) || assetBaseName(asset) !== missing.name) continue;
+		if (used.has(key)) return false;
 		const link = linkTargetForAsset(note.body, asset);
-		if (!link || link.embed !== missing.embed || !sameAttachmentLabel(link.label, missing.label)) continue;
-		if (!stageAsset(note, asset)) continue;
-		used.add(key);
-		return asset;
-	}
-	return undefined;
+		if (!link || link.embed !== missing.embed || !stageAsset(note, asset)) return false;
+
+		// New conversions retain source identity. Never fall back to a visible
+		// label when either side has that identity: OCR is intentionally absent
+		// from current Markdown and is not evidence that two assets correspond.
+		if (!attachmentIdentityMatches(asset, missing)) return false;
+		const identified = missing.sourceName !== undefined || missing.ordinal !== undefined || asset.sourceName !== undefined || asset.ordinal !== undefined;
+		return identified || sameAttachmentLabel(link.label, missing.label);
+	});
+
+	// Even exact source identity must not select an arbitrary duplicate from a
+	// malformed or incomplete manifest.
+	if (candidates.length !== 1) return undefined;
+	const asset = candidates[0];
+	used.add(`${note.file}\u0000${asset.path}`);
+	return asset;
 }
 
 function assetDestinationName(asset: Asset): string {
@@ -277,6 +327,9 @@ function copyAsset(note: PageNote, asset: Asset, noteTarget: string, buildRoot: 
 			path: posix(path.relative(buildRoot, target)),
 			length: asset.length,
 			sha256: sourceHash,
+			sourceName: asset.sourceName,
+			ordinal: asset.ordinal,
+			embed: asset.embed,
 		},
 		markdownPath: posix(path.relative(path.dirname(noteTarget), target)),
 	};

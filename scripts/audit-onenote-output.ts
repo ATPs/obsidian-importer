@@ -10,6 +10,7 @@ interface Asset {
 	path: string;
 	length: number;
 	sha256: string;
+	sourceName?: string;
 }
 
 interface Page {
@@ -105,6 +106,7 @@ const failures: Record<string, Finding[]> = {
 	frontmatter: [],
 	flattenedLines: [],
 	htmlFallbacks: [],
+	imageLabels: [],
 	localLinks: [],
 	manifestAssets: [],
 	attachmentConsistency: [],
@@ -121,6 +123,7 @@ const missingAssetPages: { file: string, count: number, names: string[] }[] = []
 const recoveredAssetPages: { file: string, count: number }[] = [];
 const manifestAssetDetails: { file: string, path: string, length: number, sha256: string }[] = [];
 const manifestTargetsByPage = new Map<string, Set<string>>();
+const manifestAssetsByPage = new Map<string, Map<string, Asset>>();
 const allManifestTargets = new Set<string>();
 const bodyAttachmentTargetsByPage = new Map<string, Set<string>>();
 const allBodyAttachmentTargets = new Set<string>();
@@ -161,7 +164,7 @@ function assets(frontMatter: Record<string, unknown>, file: string): Asset[] {
 		}
 		const asset = value as Partial<Asset>;
 		return typeof asset.path === 'string' && typeof asset.length === 'number' && typeof asset.sha256 === 'string'
-			? [asset as Asset]
+			? [{ ...asset, sourceName: typeof asset.sourceName === 'string' ? asset.sourceName : undefined }]
 			: (addFailure('manifestAssets', file, `Malformed asset manifest entry: ${JSON.stringify(value)}`), []);
 	});
 }
@@ -210,6 +213,8 @@ for (const file of markdown) {
 
 	const pageManifestTargets = new Set<string>();
 	manifestTargetsByPage.set(normalizePath(file), pageManifestTargets);
+	const pageManifestAssets = new Map<string, Asset>();
+	manifestAssetsByPage.set(normalizePath(file), pageManifestAssets);
 	for (const asset of assets(parsed.frontMatter, file)) {
 		manifestAssets++;
 		const target = resolveManifestAsset(page, asset.path);
@@ -219,6 +224,7 @@ for (const file of markdown) {
 		}
 		const normalizedTarget = normalizePath(target);
 		pageManifestTargets.add(normalizedTarget);
+		pageManifestAssets.set(normalizedTarget, asset);
 		allManifestTargets.add(normalizedTarget);
 		if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
 			addFailure('manifestAssets', file, `Missing asset: ${asset.path}`);
@@ -362,6 +368,91 @@ function inlineDestinations(markdownBody: string): string[] {
 	return destinations;
 }
 
+interface MarkdownImage {
+	label: string;
+	destination: string;
+}
+
+function markdownImages(markdownBody: string): MarkdownImage[] {
+	const images: MarkdownImage[] = [];
+	for (let index = 0; index < markdownBody.length; index++) {
+		if (markdownBody[index] !== '!' || markdownBody[index + 1] !== '[') continue;
+		let labelEnd = -1;
+		let escaped = false;
+		for (let cursor = index + 2; cursor < markdownBody.length; cursor++) {
+			const character = markdownBody[cursor];
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (character === '\\') {
+				escaped = true;
+				continue;
+			}
+			if (character === ']') {
+				labelEnd = cursor;
+				break;
+			}
+		}
+		if (labelEnd < 0 || markdownBody[labelEnd + 1] !== '(') continue;
+		let depth = 1;
+		escaped = false;
+		for (let cursor = labelEnd + 2; cursor < markdownBody.length; cursor++) {
+			const character = markdownBody[cursor];
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (character === '\\') {
+				escaped = true;
+				continue;
+			}
+			if (character === '(') depth++;
+			else if (character === ')' && --depth === 0) {
+				images.push({
+					label: markdownBody.slice(index + 2, labelEnd),
+					destination: markdownBody.slice(labelEnd + 2, cursor),
+				});
+				index = cursor;
+				break;
+			}
+		}
+	}
+	return images;
+}
+
+function unescapeMarkdownLabel(label: string): string {
+	return label.replace(/\\([\\\[\]`<])/g, '$1');
+}
+
+function imageLabelFailure(page: Page, image: MarkdownImage): string | null {
+	const label = unescapeMarkdownLabel(image.label);
+	if (/\r|\n/u.test(label)) return 'Image label must be a single line; OCR or recognition text must not be used as an image label';
+	if (label === '') return 'Image label is empty; use the source filename or generated attachment filename';
+	if (label.length > 255) return `Image label has ${label.length} characters; use the source filename or generated attachment filename`;
+	const destination = stripMarkdownDestination(image.destination).split('#')[0].split('?')[0];
+	let decoded = destination;
+	try {
+		decoded = decodeURI(destination);
+	}
+	catch {
+		return `Image label cannot be checked because its destination is malformed: ${destination}`;
+	}
+	const target = path.resolve(path.dirname(page.file), ...decoded.replaceAll('\\', '/').split('/'));
+	const asset = manifestAssetsByPage.get(normalizePath(page.file))?.get(normalizePath(target));
+	if (!asset) return null;
+	const generatedName = path.basename(decoded);
+	const sourceName = asset.sourceName && path.basename(asset.sourceName.replaceAll('\\', '/'));
+	const expected = new Set([generatedName, sourceName].filter((name): name is string => name !== undefined && name !== ''));
+	// An older backup can provide a recovered asset whose original file name is
+	// unavailable in the selected page's manifest. Its short filename label is
+	// still valid, but an identified current asset must retain its own name.
+	if (sourceName && ![...expected].some(name => label.normalize('NFC') === name.normalize('NFC'))) {
+		return `Image label must equal its source or generated attachment filename (${[...expected].join(', ')}); likely OCR or descriptive alt text was emitted instead`;
+	}
+	return null;
+}
+
 function withoutFencedCode(markdownBody: string): string {
 	let insideFence = false;
 	return markdownBody.split(/(\r?\n)/).map(part => {
@@ -406,6 +497,10 @@ function localExistingTarget(page: Page, rawDestination: string): string | null 
 
 for (const page of pages) {
 	const linkBody = withoutFencedCode(page.body);
+	for (const image of markdownImages(linkBody)) {
+		const detail = imageLabelFailure(page, image);
+		if (detail) addFailure('imageLabels', page.file, detail);
+	}
 	const bodyAttachmentTargets = new Set<string>();
 	bodyAttachmentTargetsByPage.set(normalizePath(page.file), bodyAttachmentTargets);
 	const retainedOneNoteLinks = linkBody.match(/onenote:[^\s)>]+/giu) ?? [];

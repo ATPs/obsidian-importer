@@ -9,6 +9,15 @@ export interface ResolvedAttachment {
 	name: string;
 	length?: number;
 	sha256?: string;
+	sourceName?: string;
+	ordinal?: number;
+	embed?: boolean;
+}
+
+export interface AssetSource {
+	sourceName?: string;
+	ordinal?: number;
+	embed: boolean;
 }
 
 export type SkipReason =
@@ -17,7 +26,7 @@ export type SkipReason =
 
 export interface OneNoteConversionOptions {
 	/** Writes one asset and answers with the link target, or null to leave it out. */
-	saveAttachment: (data: Uint8Array, suggestedName: string) => Promise<ResolvedAttachment | null>;
+	saveAttachment: (data: Uint8Array, suggestedName: string, source?: AssetSource) => Promise<ResolvedAttachment | null>;
 	/** Turns an internal OneNote page title into the note name written by the importer. */
 	/** Answers with every imported page that can be the target. */
 	resolveInternalLink?: (pageTitle: string) => string | string[] | undefined;
@@ -34,6 +43,8 @@ export interface MissingAsset {
 	name: string;
 	label: string;
 	embed: boolean;
+	sourceName?: string;
+	ordinal?: number;
 }
 
 export interface ConvertedPage {
@@ -621,6 +632,13 @@ function taskPrefix(tags: Tag[] | undefined, list: ListInfo | undefined): string
 	return '\t'.repeat(list?.level ?? 0) + (task.completed ? '- [x] ' : '- [ ] ');
 }
 
+function imageLabel(fileName: string | undefined): string | undefined {
+	if (!fileName) return undefined;
+	const baseName = fileName.split(/[\\/]/).at(-1)?.trim().replace(/[\r\n\v]+/g, ' ');
+	if (!baseName) return undefined;
+	return escapeInline(baseName.replace(/\\/g, '\\\\'));
+}
+
 // NoteTagShape values that represent admonitions. Labels are localized.
 const CALLOUT_SHAPES: Record<number, string> = {
 	13: 'important',  // Yellow star
@@ -652,6 +670,17 @@ interface Block {
 	callout?: string;
 }
 
+interface RenderContext {
+	listDepth: number;
+	parentList?: {
+		level: number;
+		prefix: string;
+		hasText: boolean;
+	};
+}
+
+const ROOT_CONTEXT: RenderContext = { listDepth: 0 };
+
 function extensionOf(fileName: string | undefined): string | undefined {
 	return fileName?.match(/\.[^.\\/]+$/)?.[0];
 }
@@ -666,7 +695,7 @@ function withExtension(base: string, extension: string | undefined): string {
 class PageWriter {
 	private readonly blocks: Block[] = [];
 	private readonly inkStrokes: SvgStroke[] = [];
-	private readonly recognizedText: string[] = [];
+	private readonly imageOrdinals = new Map<string, number>();
 	readonly attachments: ResolvedAttachment[] = [];
 	readonly missingAssets: MissingAsset[] = [];
 	htmlFallbacks = 0;
@@ -703,7 +732,7 @@ class PageWriter {
 		this.blocks.push({ text: `${opening}\n${quoted}`, listItem: false, callout: opening });
 	}
 
-	async writeElements(elements: Element[]): Promise<void> {
+	async writeElements(elements: Element[], context: RenderContext = ROOT_CONTEXT): Promise<void> {
 		for (let index = 0; index < elements.length;) {
 			if (this.options.isCancelled?.()) {
 				this.cancelled = true;
@@ -715,28 +744,39 @@ class PageWriter {
 				index = code.end;
 				continue;
 			}
-			await this.writeElement(elements[index]);
+			await this.writeElement(elements[index], context);
 			index++;
 		}
 	}
 
-	private async writeElement(element: Element): Promise<void> {
+	private async writeElement(element: Element, context: RenderContext): Promise<void> {
 		switch (element.kind) {
-			case 'outline':
-				await this.writeElements(element.children);
+			case 'outline': {
+				const level = element.list ? Math.max(element.list.level, context.listDepth) : 0;
+				const list = element.list && { ...element.list, level };
+				await this.writeElements(element.children, {
+					...context,
+					listDepth: element.list ? level + 1 : context.listDepth,
+					parentList: list ? {
+						level,
+						prefix: listPrefix(list),
+						hasText: false,
+					} : context.parentList,
+				});
 				break;
+			}
 			case 'paragraph':
-				await this.writeParagraph(element);
+				await this.writeParagraph(element, context);
 				break;
 			case 'table':
 				await this.writeTable(element);
 				break;
 			case 'image':
-				await this.writeAsset(element.data, this.imageName(element), element.altText ?? '', true);
+				await this.writeImage(element, context);
 				break;
 			case 'embedded-file': {
 				const name = withExtension(element.fileName ?? 'attachment', element.extension);
-				await this.writeAsset(element.data, name, name, false);
+				await this.writeAsset(element.data, name, name, false, context);
 				break;
 			}
 			case 'ink':
@@ -745,7 +785,7 @@ class PageWriter {
 		}
 	}
 
-	private async writeParagraph(paragraph: Paragraph): Promise<void> {
+	private async writeParagraph(paragraph: Paragraph, context: RenderContext): Promise<void> {
 		const raw = rawParagraphText(paragraph);
 		if (!paragraph.list && !paragraph.styleId
 			&& raw.length >= 120
@@ -753,15 +793,18 @@ class PageWriter {
 			&& !/^\s*[A-Za-z_]\w*\s*=.*?,\s*(?:which means|that is|i\.e\.)\b/mi.test(raw)
 			&& /^(?:\s*[A-Za-z_]\w*(?:\[[^\n]+\])?\s*=|\s*(?:for|if|while)\b|\s*\w+(?:\.\w+)+\s*\()/m.test(raw)) {
 			this.push(fencedCode(raw.split('\n')));
-			await this.writeElements(paragraph.children);
+			await this.writeElements(paragraph.children, context);
 			return;
 		}
 		let text = renderRuns(paragraph.runs, this.options);
+		const level = paragraph.list ? Math.max(paragraph.list.level, context.listDepth) : 0;
+		const list = paragraph.list && { ...paragraph.list, level };
+		const task = taskPrefix(paragraph.tags, list);
+		const prefix = task ?? listPrefix(list);
+		let wroteText = false;
 
 		if (text !== '') {
-			const task = taskPrefix(paragraph.tags, paragraph.list);
-			const prefix = task ?? listPrefix(paragraph.list) ?? '';
-			const indent = '\t'.repeat(paragraph.list?.level ?? 0);
+			const indent = '\t'.repeat(level);
 			const heading = headingPrefix(paragraph.styleId);
 			if (heading) text = cleanHeadingText(text);
 
@@ -771,9 +814,13 @@ class PageWriter {
 
 			if (callout && !paragraph.list && !task) this.pushCallout(callout, body);
 			else this.push(body, task !== undefined || paragraph.list !== undefined);
+			wroteText = true;
 		}
 
-		await this.writeElements(paragraph.children);
+		await this.writeElements(paragraph.children, paragraph.list ? {
+			listDepth: level + 1,
+			parentList: { level, prefix, hasText: wroteText },
+		} : context);
 	}
 
 	private async writeTable(table: Table): Promise<void> {
@@ -826,48 +873,58 @@ class PageWriter {
 			});
 		}
 
-		// Recognition text is repeated on every stroke in a word.
-		if (ink.recognizedText && ink.recognizedText !== this.recognizedText[this.recognizedText.length - 1]) {
-			this.recognizedText.push(ink.recognizedText);
-		}
 	}
 
 	async writeCollectedInk(): Promise<void> {
 		const svg = strokesToSvg(this.inkStrokes);
 		if (!svg) return;
 
-		const recognized = this.recognizedText.join(' ');
-		await this.writeAsset(new TextEncoder().encode(svg), `${this.pageTitle} - Ink.svg`, recognized, true);
-
-		if (recognized !== '') this.push(recognized);
+		await this.writeAsset(new TextEncoder().encode(svg), `${this.pageTitle} - Ink.svg`, undefined, true, ROOT_CONTEXT);
 	}
 
 	private imageName(image: Image): string {
 		return withExtension(`${this.pageTitle} image`, image.extension ?? extensionOf(image.fileName));
 	}
 
-	private async writeAsset(data: Uint8Array | undefined, name: string, label: string, embed: boolean): Promise<void> {
-		const link = await this.renderAsset(data, name, label, embed);
-		if (link) this.push(link);
+	private imageSource(image: Image): AssetSource {
+		const sourceName = image.fileName;
+		const key = sourceName ?? '';
+		const ordinal = this.imageOrdinals.get(key) ?? 0;
+		this.imageOrdinals.set(key, ordinal + 1);
+		return { sourceName, ordinal, embed: true };
 	}
 
-	private async renderAsset(data: Uint8Array | undefined, name: string, label: string, embed: boolean): Promise<string | undefined> {
+	private async writeImage(image: Image, context: RenderContext): Promise<void> {
+		await this.writeAsset(image.data, this.imageName(image), imageLabel(image.fileName), true, context, this.imageSource(image));
+	}
+
+	private async writeAsset(data: Uint8Array | undefined, name: string, label: string | undefined, embed: boolean, context: RenderContext, source?: AssetSource): Promise<void> {
+		const link = await this.renderAsset(data, name, label, embed, source);
+		if (!link) return;
+		const parentList = context.parentList;
+		if (!parentList) this.push(link);
+		else if (parentList.hasText) this.push(`${'\t'.repeat(parentList.level + 1)}${link}`, true);
+		else this.push(parentList.prefix + link, true);
+	}
+
+	private async renderAsset(data: Uint8Array | undefined, name: string, label: string | undefined, embed: boolean, source?: AssetSource): Promise<string | undefined> {
 		if (!data || data.length === 0) {
 			this.options.onSkipped?.(name, 'no-data');
-			this.missingAssets.push({ name, label, embed });
+			this.missingAssets.push({ name, label: label ?? name, embed, ...source });
 			return undefined;
 		}
 
-		const attachment = await this.options.saveAttachment(data, name);
+		const attachment = await this.options.saveAttachment(data, name, source);
 		if (!attachment) {
 			this.options.onSkipped?.(name, 'no-data');
-			this.missingAssets.push({ name, label, embed });
+			this.missingAssets.push({ name, label: label ?? name, embed, ...source });
 			return undefined;
 		}
 
-		this.attachments.push(attachment);
+		this.attachments.push({ ...attachment, ...source });
 		const target = encodeURI(attachment.path);
-		return embed ? `![${label}](${target})` : `[${label}](${target})`;
+		const display = label ?? imageLabel(attachment.name) ?? '';
+		return embed ? `![${display}](${target})` : `[${display}](${target})`;
 	}
 
 	private async renderCell(children: Element[], separator = ' '): Promise<string> {
@@ -883,7 +940,7 @@ class PageWriter {
 					parts.push(await this.renderCell(child.children, separator));
 					break;
 				case 'image':
-					parts.push(await this.renderAsset(child.data, this.imageName(child), child.altText ?? '', true) ?? '');
+					parts.push(await this.renderAsset(child.data, this.imageName(child), imageLabel(child.fileName), true, this.imageSource(child)) ?? '');
 					break;
 				case 'embedded-file': {
 					const name = withExtension(child.fileName ?? 'attachment', child.extension);
@@ -936,7 +993,7 @@ class PageWriter {
 			else if (element.kind === 'outline') parts.push(await this.renderHtmlElements(element.children));
 			else if (element.kind === 'table') parts.push(await this.renderHtmlTable(element));
 			else if (element.kind === 'image') {
-				const link = await this.renderAsset(element.data, this.imageName(element), element.altText ?? '', true);
+				const link = await this.renderAsset(element.data, this.imageName(element), imageLabel(element.fileName), true, this.imageSource(element));
 				if (link) {
 					const match = /^!\[(.*)\]\((.*)\)$/.exec(link);
 					if (match) parts.push(`<img src="${html(match[2])}" alt="${html(match[1])}">`);

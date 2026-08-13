@@ -1,0 +1,99 @@
+Continue improving the OneNote backup-to-Markdown export tool in this repository:
+
+C:\Users\ATPs\Documents\GitHub\obsidian-importer
+
+Read these files first:
+- AGENTS.md
+- docs/onenote-backup-export.md
+- H:\x\temp\md-improvement-notes\final-audit.json
+
+The latest committed and pushed implementation is:
+
+e8e6024 Improve OneNote backup export
+
+Current published output:
+
+H:\x\temp\md
+
+Source backup directories (read-only):
+- H:\x\temp\HumanNovelProteins
+- H:\x\temp\MouseOmics
+- H:\x\temp\NeuropathicPain2020
+- H:\x\temp\Rutgers
+
+Current published audit results:
+- 568 Markdown pages and 568 unique OneNote page IDs
+- 1,766 fenced code blocks
+- 155 GFM tables
+- 4 HTML table tags representing one approved local nested-table fallback:
+  MouseOmics/Summary/2022 Transcriptome.md
+- 225 manifest assets, 225 body references, and 225 attachment files on disk
+- 108 attachments strictly recovered from older backups
+- 8 remaining missing attachments; no reliable source bytes exist, so do not
+  attach similarly named assets speculatively
+- 0 XML fences, preservation headings, archive files, retained OneNote links,
+  OneMore navigation URLs, invalid links, unclosed fences, or audit failures
+
+Important output policy:
+- Preserve newest page text.
+- Recover an old attachment only if ownership and correspondence are defensible.
+- Unique same-notebook page targets become local relative Markdown links.
+- Cross-notebook, unresolved, ambiguous, OneNote, and OneMore links retain
+  visible text only. Never retain the original OneNote URL.
+- Prefer Markdown. Use local HTML only for a genuine nested two-dimensional
+  table. The approved complex test page above is the only current fallback.
+- Do not output preservation XML, whole-page XML, or _OneNote archive.md.
+- Literal XML that is user page content may remain in an ordinary fenced code
+  block, not an xml-language fence.
+- Do not delete old candidates, staging directories, or md-backup-* directories
+  without explicit user approval.
+
+Tools added/used:
+- scripts/convert-onenote-local.ts: local single source/directory conversion
+- scripts/export-onenote-backups.ts: convert all backup versions, select newest
+  page content, and strictly merge older attachments
+- scripts/audit-onenote-output.ts: structural, link, attachment, and source audit
+
+For every converter change:
+1. Add a focused regression test in tests/onenote-file/.
+2. Run:
+   .\node_modules\.bin\tsx.cmd --disable-warning=ExperimentalWarning --tsconfig tsconfig.test.json --test "tests/onenote-file/**/*.test.ts"
+   .\node_modules\.bin\tsc.cmd --noEmit --skipLibCheck
+   .\node_modules\.bin\eslint.cmd src
+   node esbuild.config.mjs production
+   git diff --check
+3. Fully rebuild a NEW candidate from all four original source directories.
+   Do not use --reuse-staging after a code change.
+4. Move candidate\_staging outside the candidate root before audit.
+5. Audit candidate with scripts/audit-onenote-output.ts. Require failureCount=0.
+6. Search candidate Markdown for:
+   onenote:|onemore:|HYPERLINK\s+"|\*\*\\?<\?xml
+   The search must return no files.
+7. Snapshot a verified candidate under H:\x\temp\md-improvement-notes before
+   publishing. Rename published md to a timestamped md-backup-* directory, then
+   rename the candidate to H:\x\temp\md. Re-run the audit against publication.
+
+Latest review records are under H:\x\temp\md-improvement-notes:
+- HumanNovelProteins-review.csv (273 pages)
+- MouseOmics-review.csv (89 pages)
+- NeuropathicPain2020-review.csv (59 pages)
+- Rutgers-review.csv (147 pages)
+
+All 568 review records are non-pending and current_sha256 was synchronized to
+the latest published output. Retain page-specific evidence notes; update only
+the hash after publishing a regenerated tree unless a newly confirmed issue
+changes the review conclusion.
+
+Known intentionally unresolved source-attachment cases total 8:
+- Rutgers/TS/20200103-20-15-11 Disease reason collect.md (2)
+- HumanNovelProteins/perGeno/A multi-enzyme map of the HeLa Proteome.md
+- MouseOmics/2022diabetes/code/20221120 DESeq New model.md
+- NeuropathicPain2020/background/20201005 Neuropathic pain possible mechanisms.md
+- NeuropathicPain2020/results/Map 21 gene lists to String700.md
+- Rutgers/2020WCPG/2020 MidAtlant Bioinformatics Conferences.md
+- Rutgers/meeting/Mobile element and intelligence.md
+
+When I report a new bug, reproduce it from the actual page and source backup,
+then make the smallest safe general converter improvement. Do not accept a
+passing simplified test if the real page is still wrong; verify the fresh full
+candidate directly before publishing.

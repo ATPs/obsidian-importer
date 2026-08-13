@@ -8,7 +8,7 @@ import { selectedNodes } from '../tree';
 import { TreePicker, ViewableNode } from '../tree-view';
 import { describeReason, extensionFromBytes, parseFrontMatterBlock, sanitizeFileName, serializeFrontMatter, uint8arrayToArrayBuffer } from '../util';
 import { findBackupFolder } from './onenote-file/backup-folder';
-import { convertPage } from './onenote-file/convert';
+import { AssetSource, convertPage } from './onenote-file/convert';
 import { OneNoteErrorKind, OneNoteFormatError } from './onenote-file/errors';
 import { isPackage, listSections, readSections } from './onenote-file/package';
 import { sha256Hex } from './onenote-file/preservation';
@@ -38,6 +38,9 @@ interface AssetManifestEntry {
 	path: string;
 	length: number;
 	sha256: string;
+	sourceName?: string;
+	ordinal?: number;
+	embed?: boolean;
 }
 
 interface GeneratedAsset extends AssetManifestEntry {
@@ -346,9 +349,9 @@ export class OneNoteFileImporter extends FormatImporter {
 
 			const notePath = planned.targetPath;
 			const oldAssets = planned.file ? assetsIn(await this.vault.read(planned.file)) : [];
-			const save = async (bytes: Uint8Array, suggested: string) => {
+			const save = async (bytes: Uint8Array, suggested: string, source?: AssetSource) => {
 				const saved = await this.saveAttachment(ctx, bytes, suggested, notePath);
-				const asset = { path: saved.path, length: bytes.length, sha256: await sha256Hex(bytes) };
+				const asset = { path: saved.path, length: bytes.length, sha256: await sha256Hex(bytes), ...source };
 				generatedAssets.push({ ...asset, created: saved.created });
 				return { name: saved.name, ...asset };
 			};
@@ -579,7 +582,9 @@ function uniqueAssets(assets: GeneratedAsset[]): GeneratedAsset[] {
 }
 
 function assetManifest(assets: GeneratedAsset[]): AssetManifestEntry[] {
-	return uniqueAssets(assets).map(({ path, length, sha256 }) => ({ path, length, sha256 }));
+	return uniqueAssets(assets).map(({ path, length, sha256, sourceName, ordinal, embed }) => ({
+		path, length, sha256, sourceName, ordinal, embed,
+	}));
 }
 
 function assetsIn(markdown: string): AssetManifestEntry[] {
@@ -589,7 +594,14 @@ function assetsIn(markdown: string): AssetManifestEntry[] {
 		if (!item || typeof item !== 'object') return [];
 		const asset = item as Partial<AssetManifestEntry>;
 		return typeof asset.path === 'string' && typeof asset.length === 'number' && typeof asset.sha256 === 'string'
-			? [{ path: asset.path, length: asset.length, sha256: asset.sha256 }]
+			? [{
+				path: asset.path,
+				length: asset.length,
+				sha256: asset.sha256,
+				sourceName: typeof asset.sourceName === 'string' ? asset.sourceName : undefined,
+				ordinal: typeof asset.ordinal === 'number' ? asset.ordinal : undefined,
+				embed: typeof asset.embed === 'boolean' ? asset.embed : undefined,
+			}]
 			: [];
 	});
 }

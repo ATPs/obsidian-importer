@@ -188,19 +188,43 @@ test('a table with no rows produces nothing at all', async () => {
 	assert.equal(await render({ kind: 'table', rows: [] }), '');
 });
 
-test('an image is named after its page, and an embedded file keeps its own name', async () => {
+test('an image is named after its page but labelled from its source filename', async () => {
 	const data = new Uint8Array([1, 2, 3]);
 
 	assert.equal(
 		await render({ kind: 'image', fileName: 'Untitled picture.png', altText: 'a shot', data }),
-		'![a shot](files/Test%20image.png)');
+		'![Untitled picture.png](files/Test%20image.png)');
 	assert.equal(
 		await render({ kind: 'image', extension: '.jpg', data }),
-		'![](files/Test%20image.jpg)');
+		'![Test image.jpg](files/Test%20image.jpg)');
 
 	assert.equal(
 		await render({ kind: 'embedded-file', fileName: 'notes.docx', data }),
 		'[notes.docx](files/notes.docx)');
+});
+
+test('image labels do not expose OneNote recognition text', async () => {
+	const converted = await convertPage(page({
+		kind: 'image',
+		fileName: 'diagram [final].png',
+		altText: 'A very long OCR transcription\nthat must not appear in Markdown.',
+		data: new Uint8Array([1]),
+	}), { saveAttachment: async (_bytes, name) => ({ path: `files/${name}`, name }) });
+
+	assert.equal(converted.markdown, '![diagram \\[final\\].png](files/Test%20image.png)');
+	assert.doesNotMatch(converted.markdown, /OCR transcription/);
+	assert.deepEqual(converted.attachments.map(asset => ({ sourceName: asset.sourceName, ordinal: asset.ordinal, embed: asset.embed })), [{
+		sourceName: 'diagram [final].png', ordinal: 0, embed: true,
+	}]);
+});
+
+test('images with identical source names have stable per-name ordinals', async () => {
+	const converted = await convertPage(page(
+		{ kind: 'image', fileName: 'plot.png', data: new Uint8Array([1]) },
+		{ kind: 'image', fileName: 'plot.png', data: new Uint8Array([2]) },
+	), { saveAttachment: async (_bytes, name, source) => ({ path: `files/${name}`, name, ...source }) });
+
+	assert.deepEqual(converted.attachments.map(asset => asset.ordinal), [0, 1]);
 });
 
 test('an asset with no bytes is reported rather than linked', async () => {
@@ -247,6 +271,46 @@ test('children of a paragraph follow it', async () => {
 	const markdown = await render(para('parent', { children: [para('child', { list: { level: 1, ordered: false } })] }));
 
 	assert.equal(markdown, 'parent\n\n\t- child');
+});
+
+test('structural list nesting supplements missing local list levels', async () => {
+	const markdown = await render(para('parent', {
+		list: { level: 0, ordered: false },
+		children: [para('child', {
+			list: { level: 0, ordered: false },
+			children: [para('grandchild', { list: { level: 0, ordered: true } })],
+		})],
+	}));
+
+	assert.equal(markdown, ['- parent', '\t- child', '\t\t1. grandchild'].join('\n'));
+});
+
+test('an image owned by a list item stays in that list', async () => {
+	const markdown = await render(para('figure', {
+		list: { level: 0, ordered: false },
+		children: [{ kind: 'image', fileName: 'chart.png', data: new Uint8Array([1]) }],
+	}));
+
+	assert.equal(markdown, ['- figure', '\t![chart.png](files/Test%20image.png)'].join('\n'));
+});
+
+test('a list item containing only an image uses the list marker', async () => {
+	const markdown = await render(para('', {
+		list: { level: 0, ordered: false },
+		children: [{ kind: 'image', fileName: 'chart.png', data: new Uint8Array([1]) }],
+	}));
+
+	assert.equal(markdown, '- ![chart.png](files/Test%20image.png)');
+});
+
+test('a list wrapper around an image uses the wrapper marker and indent', async () => {
+	const markdown = await render({
+		kind: 'outline',
+		list: { level: 0, ordered: false },
+		children: [{ kind: 'image', fileName: 'chart.png', data: new Uint8Array([1]) }],
+	});
+
+	assert.equal(markdown, '- ![chart.png](files/Test%20image.png)');
 });
 
 test('cancelling stops the conversion where it stands', async () => {
@@ -463,7 +527,7 @@ test('a table cell keeps the picture in it', async () => {
 		saved.push(name); return { path: name, name }; 
 	} });
 
-	assert.equal(converted.markdown.split('\n')[0], '| ![](Test%20image.png) | beside it |');
+	assert.equal(converted.markdown.split('\n')[0], '| ![in-cell.png](Test%20image.png) | beside it |');
 	assert.deepEqual(saved, ['Test image.png']);
 });
 
