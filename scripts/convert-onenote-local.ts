@@ -10,7 +10,9 @@ import * as zlib from 'node:zlib';
 import { NodePickedFile, provideNodeModules } from '../src/filesystem';
 import { OneNoteFileImporter } from '../src/formats/onenote-file';
 import { ImportContext } from '../src/import-context';
+import { extensionFromBytes, parseFrontMatterBlock, serializeFrontMatter } from '../src/util';
 import { MemoryVault, memoryApp } from '../tests/shims/vault';
+import { convertEmfToPng, emfPngSettings } from './emf-to-png';
 
 class ConsoleContext extends ImportContext {
 	protected onStatus(message: string): void {
@@ -40,6 +42,134 @@ export interface LocalConversionReport {
 	skipped: unknown[];
 	log: unknown[];
 	outputFiles: string[];
+	emfConversions: EmfConversion[];
+}
+
+export interface EmfConversion {
+	input: string;
+	output: string;
+	width: number;
+	height: number;
+}
+
+interface AssetManifestEntry {
+	path: string;
+	length: number;
+	sha256: string;
+	sourceName?: string;
+	ordinal?: number;
+	embed?: boolean;
+}
+
+function utf8(content: string | ArrayBuffer): string {
+	return typeof content === 'string' ? content : new TextDecoder().decode(content);
+}
+
+function replaceAssetReference(content: string, before: string, after: string): string {
+	return content.replaceAll(encodeURI(before), encodeURI(after)).replaceAll(before, after);
+}
+
+/**
+ * The portable backup export intentionally replaces EMF with PNG for Obsidian.
+ * The interactive importer does not use this function and continues preserving
+ * original EMF bytes.
+ */
+async function replaceEmfWithPng(vault: MemoryVault): Promise<EmfConversion[]> {
+	const conversions: EmfConversion[] = [];
+	const emfPaths = vault.paths().filter(file => file.toLocaleLowerCase().endsWith('.emf'));
+
+	for (const emfPath of emfPaths) {
+		const source = vault.contents.get(emfPath);
+		if (!(source instanceof ArrayBuffer)) throw new Error(`EMF attachment is not binary: ${emfPath}`);
+		const png = await convertEmfToPng(new Uint8Array(source));
+		const base = emfPath.slice(0, -4);
+		let pngPath = `${base}.png`;
+		// A OneNote page can contain a PNG and EMF that share the generated
+		// attachment stem. Keep both images instead of overwriting the PNG.
+		if (vault.contents.has(pngPath)) {
+			for (let index = 0; ; index++) {
+				const suffix = index === 0 ? ' EMF' : ` EMF ${index}`;
+				pngPath = `${base}${suffix}.png`;
+				if (!vault.contents.has(pngPath)) break;
+			}
+		}
+		vault.contents.set(pngPath, png.bytes.buffer.slice(png.bytes.byteOffset, png.bytes.byteOffset + png.bytes.byteLength));
+		vault.remove(emfPath);
+		conversions.push({ input: emfPath, output: pngPath, width: png.width, height: png.height });
+	}
+
+	const renamed = new Map<string, string>();
+	for (const assetPath of vault.paths()) {
+		const content = vault.contents.get(assetPath);
+		if (!(content instanceof ArrayBuffer) || assetPath.toLocaleLowerCase().endsWith('.emf')) continue;
+		const extension = extensionFromBytes(new Uint8Array(content));
+		const current = assetPath.match(/\.[^.\\/]+$/u)?.[0].slice(1).toLocaleLowerCase();
+		const compatible = extension === 'jpg' ? current === 'jpg' || current === 'jpeg' : current === extension;
+		if (!extension || compatible) continue;
+		const next = assetPath.replace(/\.[^.\\/]+$/u, `.${extension}`);
+		if (vault.contents.has(next)) throw new Error(`Attachment type correction would overwrite an asset: ${next}`);
+		vault.contents.set(next, content);
+		vault.remove(assetPath);
+		renamed.set(assetPath, next);
+	}
+
+	if (conversions.length === 0 && renamed.size === 0) return conversions;
+	const converted = new Map(conversions.map(item => [item.input, item]));
+	for (const markdownPath of vault.paths().filter(file => file.toLocaleLowerCase().endsWith('.md'))) {
+		const content = vault.contents.get(markdownPath);
+		if (!content) continue;
+		const parsed = parseFrontMatterBlock(utf8(content));
+		if (!parsed) throw new Error(`Cannot update EMF manifest without frontmatter: ${markdownPath}`);
+		const rawAssets = parsed.frontMatter['onenote-assets'];
+		if (!Array.isArray(rawAssets)) continue;
+		let changed = false;
+		const labelReplacements: { before: string, after: string }[] = [];
+		const assets: unknown[] = [];
+		for (const value of rawAssets) {
+			if (!value || typeof value !== 'object') {
+				assets.push(value);
+				continue;
+			}
+			const asset = value as AssetManifestEntry;
+			const vaultPath = asset.path.replaceAll('\\', '/');
+			const replacement = converted.get(vaultPath);
+			const renamedPath = renamed.get(vaultPath);
+			if (!replacement && !renamedPath) {
+				assets.push(value);
+				continue;
+			}
+			changed = true;
+			const output = replacement?.output ?? renamedPath!;
+			const bytes = vault.contents.get(output);
+			if (!(bytes instanceof ArrayBuffer)) throw new Error(`Converted PNG was not written: ${output}`);
+			const sourceName = replacement
+				? asset.sourceName?.replace(/\.emf$/iu, ' (EMF converted).png')
+				: asset.sourceName?.replace(/\.[^.\\/]+$/u, `.${path.extname(output).slice(1)}`);
+			if (asset.sourceName && sourceName && asset.sourceName !== sourceName) {
+				labelReplacements.push({ before: asset.sourceName, after: sourceName });
+			}
+			assets.push({
+				...asset,
+				path: output,
+				length: bytes.byteLength,
+				sha256: await sha256(bytes),
+				sourceName,
+			});
+		}
+		if (!changed) continue;
+		parsed.frontMatter['onenote-assets'] = assets;
+		let body = parsed.body;
+		for (const [before, item] of converted) body = replaceAssetReference(body, before, item.output);
+		for (const [before, after] of renamed) body = replaceAssetReference(body, before, after);
+		for (const label of labelReplacements) body = body.replaceAll(`![${label.before}]`, `![${label.after}]`);
+		vault.contents.set(markdownPath, serializeFrontMatter(parsed.frontMatter) + body);
+	}
+
+	return conversions;
+}
+
+async function sha256(bytes: ArrayBuffer): Promise<string> {
+	return nodeCrypto.createHash('sha256').update(new Uint8Array(bytes)).digest('hex');
 }
 
 /**
@@ -76,6 +206,7 @@ export async function convertOneNoteLocal(sourceArgument: string, destinationArg
 	const ctx = new ConsoleContext();
 	await subject.import(ctx);
 	await subject.finalizeMarkdownOutput(ctx);
+	const emfConversions = await replaceEmfWithPng(vault);
 
 	fs.mkdirSync(destination, { recursive: false });
 	for (const [vaultPath, content] of vault.contents) {
@@ -104,6 +235,7 @@ export async function convertOneNoteLocal(sourceArgument: string, destinationArg
 			reason: entry.reason instanceof Error ? entry.reason.message : entry.reason,
 		})),
 		outputFiles: vault.paths(),
+		emfConversions,
 	};
 	fs.writeFileSync(path.join(destination, '_conversion-report.json'), JSON.stringify(report, null, 2), 'utf8');
 	return report;

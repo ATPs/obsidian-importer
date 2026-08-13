@@ -264,10 +264,15 @@ export function sameAttachmentLabel(left: string, right: string): boolean {
 export function attachmentIdentityMatches(asset: Asset, missing: MissingAsset): boolean {
 	const identified = missing.sourceName !== undefined || missing.ordinal !== undefined || asset.sourceName !== undefined || asset.ordinal !== undefined;
 	return identified
-		? missing.sourceName === asset.sourceName
+		? sourceIdentityName(missing.sourceName) === sourceIdentityName(asset.sourceName)
 			&& missing.ordinal === asset.ordinal
 			&& (asset.embed === undefined || missing.embed === asset.embed)
 		: assetBaseName(asset) === missing.name;
+}
+
+/** An EMF rendered for Obsidian remains the same OneNote source image. */
+function sourceIdentityName(value: string | undefined): string | undefined {
+	return value?.replace(/ \(EMF converted\)\.png$/iu, '.emf');
 }
 
 function sourceAssetForMissing(note: PageNote, missing: MissingAsset, used: Set<string>): Asset | undefined {
@@ -474,8 +479,9 @@ function selectedPage(group: PageGroup): PageNote {
 		|| right.file.localeCompare(left.file))[0];
 }
 
-function markdownLink(missing: MissingAsset, target: string): string {
-	return missing.embed ? `![${missing.label}](${encodeURI(target)})` : `[${missing.label}](${encodeURI(target)})`;
+function markdownLink(missing: MissingAsset, target: string, asset?: Asset): string {
+	const label = asset?.sourceName ?? missing.label;
+	return missing.embed ? `![${label}](${encodeURI(target)})` : `[${label}](${encodeURI(target)})`;
 }
 
 function linkKey(value: string): string | undefined {
@@ -638,7 +644,7 @@ function writePage(
 			continue;
 		}
 		copied.push(result.asset);
-		recoveredLinks.push(markdownLink(missingAsset, result.markdownPath));
+		recoveredLinks.push(markdownLink(missingAsset, result.markdownPath, result.asset));
 		recovered++;
 	}
 

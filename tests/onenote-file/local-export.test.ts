@@ -26,6 +26,30 @@ test('local OneNote export puts attachments beside the note in attachments', asy
 	}
 });
 
+test('local OneNote export replaces EMF images with bounded PNGs', async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), 'onenote-local-export-'));
+	const output = path.join(root, 'output');
+	const source = 'H:\\x\\temp\\Rutgers\\info (于 8-12-2026).one';
+	if (!fs.existsSync(source)) return;
+
+	try {
+		const report = await convertOneNoteLocal(source, output);
+		const note = path.join(output, 'info (于 8-12-2026)', 'Operon HPC.md');
+		const png = path.join(output, 'info (于 8-12-2026)', 'attachments', 'Operon HPC image.png');
+		const body = fs.readFileSync(note, 'utf8');
+		const bytes = fs.readFileSync(png);
+
+		assert.equal(fs.existsSync(png.replace(/\.png$/u, '.emf')), false);
+		assert.deepEqual([...bytes.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		assert.match(body, /Untitled picture \(EMF converted\)\.png/u);
+		assert.doesNotMatch(body, /\.emf/u);
+		assert.deepEqual(report.emfConversions.map(item => [item.input.endsWith('.emf'), item.output.endsWith('.png'), item.width, item.height]), [[true, true, 1268, 1406]]);
+	}
+	finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test('backup merge reads structured missing assets and ignores malformed entries', () => {
 	assert.deepEqual(readMissingAssets({
 		'onenote-missing-assets': [
@@ -56,6 +80,13 @@ test('backup merge uses source identity instead of visible OCR labels when avail
 	assert.equal(attachmentIdentityMatches(
 		{ path: 'Section/attachments/page file.png', length: 1, sha256: 'hash', sourceName: 'Untitled picture.png', ordinal: 1, embed: false },
 		missing), false);
+});
+
+test('backup merge recognises an EMF source identity after it is rendered as PNG', () => {
+	assert.equal(attachmentIdentityMatches(
+		{ path: 'Section/attachments/page image.png', length: 1, sha256: 'hash', sourceName: 'Untitled picture (EMF converted).png', ordinal: 1, embed: true },
+		{ name: 'page image.emf', label: 'old', embed: true, sourceName: 'Untitled picture.emf', ordinal: 1 },
+	), true);
 });
 
 test('backup merge removes the missing asset field after recovery and keeps unrecovered entries', () => {

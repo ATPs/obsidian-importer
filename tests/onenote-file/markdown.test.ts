@@ -203,6 +203,24 @@ test('an image is named after its page but labelled from its source filename', a
 		'[notes.docx](files/notes.docx)');
 });
 
+test('a page title ending in a dotted word does not hide its image extension', async () => {
+	const converted = await convertPage(page({ kind: 'image', extension: '.png', data: new Uint8Array([1]) }), {
+		noteName: 'Plenary Genetics - Dr. Matt Hurles',
+		saveAttachment: async (_bytes, name) => ({ path: `files/${name}`, name }),
+	});
+
+	assert.equal(converted.markdown, '![Plenary Genetics - Dr. Matt Hurles image.png](files/Plenary%20Genetics%20-%20Dr.%20Matt%20Hurles%20image.png)');
+});
+
+test('a page title ending in a numeric dotted version does not hide its image extension', async () => {
+	const converted = await convertPage(page({ kind: 'image', extension: '.png', data: new Uint8Array([1]) }), {
+		noteName: 'Protein XP_010576034.1',
+		saveAttachment: async (_bytes, name) => ({ path: `files/${name}`, name }),
+	});
+
+	assert.equal(converted.markdown, '![Protein XP_010576034.1 image.png](files/Protein%20XP_010576034.1%20image.png)');
+});
+
 test('image labels do not expose OneNote recognition text', async () => {
 	const converted = await convertPage(page({
 		kind: 'image',

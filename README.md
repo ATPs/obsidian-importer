@@ -23,6 +23,101 @@ Import guides are hosted on the [official Obsidian Help site](https://obsidian.m
 - Import from Apple Journal (HTML export)
 - Import from Tomboy/Gnote (.note)
 
+## OneNote local files and backups
+
+The Obsidian importer supports local `.one`, `.onepkg`, and `.onex` files.
+For an ordinary interactive import, use **Microsoft OneNote** in Obsidian's
+Importer and select the local file. For repeatable, file-system based exports
+or multiple OneNote backup versions, use the local tools below from a checkout
+of this repository. They read the sources; always export to a new directory.
+
+### Export one file or one section backup
+
+Use this when there is one source file, or when you deliberately want each
+source file converted independently:
+
+```powershell
+.\node_modules\.bin\tsx.cmd --disable-warning=ExperimentalWarning --tsconfig tsconfig.test.json `
+  scripts\convert-onenote-local.ts `
+  "H:\OneNote backups\Research.one" `
+  "H:\exports\Research-markdown"
+```
+
+The destination must not already exist. The exporter writes Markdown, adjacent
+`attachments` directories, and `_conversion-report.json`.
+
+### Merge multiple backups of one notebook
+
+When a notebook directory contains multiple saved versions of its sections,
+use the backup merger. It converts every version into private staging, then
+publishes one Markdown tree for each input notebook directory:
+
+```powershell
+.\node_modules\.bin\tsx.cmd --disable-warning=ExperimentalWarning --tsconfig tsconfig.test.json `
+  scripts\export-onenote-backups.ts `
+  "H:\exports\md-candidate-1" `
+  "H:\OneNote backups\Research" `
+  "H:\OneNote backups\Lab notes"
+```
+
+For each section, current pages come only from its newest backup version. For
+the same page in multiple versions, its `onenote-updated` timestamp chooses
+the Markdown source; the source file modification time breaks a tie or covers
+a missing timestamp. Pages absent from the newest section version are treated
+as deleted and are not restored from an older backup.
+
+Older versions are used only to recover an attachment that the chosen current
+page explicitly reports as missing. Recovery requires a unique, compatible
+match for the original attachment identity (source name, occurrence number,
+and image-versus-file type), followed by byte-length and SHA-256 verification.
+The current page's Markdown is never replaced with older page text. Ambiguous
+or unavailable attachments remain recorded as missing instead of being guessed.
+
+### Batch-export a set of notebooks
+
+When one parent directory contains one subdirectory per notebook, use the
+Windows runner. It discovers direct `.one`, `.onepkg`, and `.onex` files in
+each notebook directory, exports every notebook, moves staging out of the
+candidate, and runs the audit. It never overwrites or publishes an existing
+export.
+
+```powershell
+# Inspect the exact notebooks and source files first.
+.\scripts\export-onenote-backup-set.ps1 `
+  "H:\OneNote backups" `
+  "H:\exports\md-candidate-1" `
+  -PlanOnly
+
+# Create and audit a new candidate.
+.\scripts\export-onenote-backup-set.ps1 `
+  "H:\OneNote backups" `
+  "H:\exports\md-candidate-1" `
+  -AuditReport "H:\exports\candidate-1-audit.json"
+```
+
+### Images, EMF, and verification
+
+Images remain images; the exporter does not add OCR or handwriting-recognition
+text. EMF figures are rendered to PNG at 300 DPI and the original EMF sidecar
+is not retained. Oversized renders preserve their aspect ratio and are reduced
+only when both dimensions exceed 2000 pixels, so the shorter edge is at most
+2000 pixels.
+
+The batch runner audits automatically. To audit a manually generated candidate:
+
+```powershell
+.\node_modules\.bin\tsx.cmd --disable-warning=ExperimentalWarning --tsconfig tsconfig.test.json `
+  scripts\audit-onenote-output.ts `
+  "H:\exports\md-candidate-1" `
+  "H:\OneNote backups\Research" `
+  | Set-Content -Encoding utf8 "H:\exports\candidate-1-audit.json"
+```
+
+Require `failureCount: 0` before publishing. The audit checks page IDs, local
+links, manifests, attachment hashes, missing/recovered attachment records, and
+the output tree. For the full workflow and safe publication procedure, see
+[the OneNote backup export guide](docs/onenote-backup-export.md).
+
 ## Developers
 
 ```bash

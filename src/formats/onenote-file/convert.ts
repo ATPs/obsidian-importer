@@ -688,8 +688,13 @@ function extensionOf(fileName: string | undefined): string | undefined {
 /** An attachment without an extension is one the vault cannot open. */
 function withExtension(base: string, extension: string | undefined): string {
 	if (!extension) return base;
-	if (extensionOf(base)) return base;
-	return base + (extension.startsWith('.') ? extension : `.${extension}`);
+	const normalized = extension.startsWith('.') ? extension : `.${extension}`;
+	// A page title can itself end in a dot and ordinary words (for example,
+	// "Dr. Matt Hurles" or a protein version ending in ".1").  That is not an
+	// attachment extension.  Only leave a name alone when it already has the
+	// exact extension supplied by OneNote.
+	if (extensionOf(base)?.toLocaleLowerCase() === normalized.toLocaleLowerCase()) return base;
+	return base + normalized;
 }
 
 class PageWriter {

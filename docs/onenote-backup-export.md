@@ -6,6 +6,29 @@ backup exports. The source backups are read-only.
 
 ## Tools
 
+### `scripts/export-onenote-backup-set.ps1`
+
+Use this Windows runner when a parent directory contains one subdirectory per
+notebook, and each notebook subdirectory holds the current and older `.one`,
+`.onepkg`, or `.onex` section backups. It discovers all qualifying immediate
+subdirectories, prints every selected source file, creates a fresh candidate,
+moves the private staging tree beside the candidate, and writes an audit report.
+It never overwrites a candidate, staging tree, audit report, source, or
+published output, and it does not publish the candidate.
+
+```powershell
+.\scripts\export-onenote-backup-set.ps1 `
+  "H:\x\temp\OneNote-backups" `
+  "H:\x\temp\md-candidate-53" `
+  -AuditReport "H:\x\temp\md-improvement-notes\candidate-53-audit.json" `
+  -PreviousAudit "H:\x\temp\md-improvement-notes\final-audit.json"
+```
+
+Use `-PlanOnly` first to list the notebook directories and direct backup files
+that would be selected without writing anything. Backups must be direct files
+inside each notebook directory; this matches `export-onenote-backups.ts` and
+prevents an unrelated nested directory from being treated as a notebook.
+
 ### `scripts/convert-onenote-local.ts`
 
 Runs the existing OneNote importer against one `.one`, `.onepkg`, `.onex` file

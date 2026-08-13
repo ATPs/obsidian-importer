@@ -28,6 +28,27 @@ function writeCandidate(root: string, imageLabel: string, sourceName = 'Direct e
 	].join('\n'));
 }
 
+function writeAssetCandidate(root: string, fileName: string, bytes: Uint8Array): void {
+	const notebook = path.join(root, 'Notebook');
+	const attachments = path.join(notebook, 'attachments');
+	fs.mkdirSync(attachments, { recursive: true });
+	fs.writeFileSync(path.join(root, '_merge-report.json'), JSON.stringify([{ notebook: 'Notebook', sources: [], sections: [{ pages: 1 }] }]));
+	fs.writeFileSync(path.join(attachments, fileName), bytes);
+	const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+	fs.writeFileSync(path.join(notebook, 'Page.md'), [
+		'---',
+		'title: Page',
+		'onenote-id: page-id',
+		'onenote-assets:',
+		`  - path: attachments/${fileName}`,
+		`    length: ${bytes.length}`,
+		`    sha256: ${sha256}`,
+		'    sourceName: Untitled picture.png',
+		'---',
+		`![Untitled picture.png](attachments/${fileName})`,
+	].join('\n'));
+}
+
 function audit(root: string): { status: number | null, report: Record<string, unknown> } {
 	const result = spawnSync(process.execPath, [
 		path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
@@ -75,6 +96,32 @@ test('OneNote output audit rejects a multiline OCR image label', () => {
 		assert.equal(result.status, 1);
 		assert.equal(result.report.failureCount, 1, JSON.stringify(result.report));
 		assert.match(JSON.stringify((result.report.failures as Record<string, unknown>).imageLabels), /single line/u);
+	}
+	finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('OneNote output audit rejects PNG bytes without a PNG extension', () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), 'onenote-output-audit-'));
+	try {
+		writeAssetCandidate(root, 'figure', new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+		const result = audit(root);
+		assert.equal(result.status, 1);
+		assert.match(JSON.stringify(result.report), /does not match PNG bytes/u);
+	}
+	finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('OneNote output audit rejects a remaining EMF attachment', () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), 'onenote-output-audit-'));
+	try {
+		writeAssetCandidate(root, 'figure.emf', new Uint8Array([1, 0, 0, 0, 0x6c]));
+		const result = audit(root);
+		assert.equal(result.status, 1);
+		assert.match(JSON.stringify(result.report), /EMF attachment was not converted/u);
 	}
 	finally {
 		fs.rmSync(root, { recursive: true, force: true });

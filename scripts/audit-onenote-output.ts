@@ -4,7 +4,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { parseFrontMatterBlock } from '../src/util';
+import { extensionFromBytes, parseFrontMatterBlock } from '../src/util';
 
 interface Asset {
 	path: string;
@@ -110,6 +110,7 @@ const failures: Record<string, Finding[]> = {
 	localLinks: [],
 	manifestAssets: [],
 	attachmentConsistency: [],
+	attachmentFormats: [],
 	pageCounts: [],
 	preservation: [],
 	sourceHashes: [],
@@ -217,6 +218,9 @@ for (const file of markdown) {
 	manifestAssetsByPage.set(normalizePath(file), pageManifestAssets);
 	for (const asset of assets(parsed.frontMatter, file)) {
 		manifestAssets++;
+		if (asset.sourceName?.toLocaleLowerCase().endsWith('.emf')) {
+			addFailure('attachmentFormats', file, `EMF source name was not updated to PNG: ${asset.sourceName}`);
+		}
 		const target = resolveManifestAsset(page, asset.path);
 		if (!target) {
 			addFailure('manifestAssets', file, `Asset escapes notebook root: ${asset.path}`);
@@ -233,6 +237,11 @@ for (const file of markdown) {
 		const bytes = fs.readFileSync(target);
 		if (bytes.length !== asset.length) addFailure('manifestAssets', file, `Wrong asset length: ${asset.path}`);
 		if (sha256(bytes) !== asset.sha256) addFailure('manifestAssets', file, `Wrong asset SHA-256: ${asset.path}`);
+		const extension = path.extname(target).slice(1).toLocaleLowerCase();
+		if (extension === 'emf') addFailure('attachmentFormats', file, `EMF attachment was not converted to PNG: ${asset.path}`);
+		const detected = extensionFromBytes(bytes);
+		const compatible = detected === 'jpg' ? extension === 'jpg' || extension === 'jpeg' : detected === extension;
+		if (detected && !compatible) addFailure('attachmentFormats', file, `Asset extension .${extension || '(none)'} does not match ${detected.toUpperCase()} bytes: ${asset.path}`);
 		manifestAssetDetails.push({ file: relativeFile, path: asset.path, length: bytes.length, sha256: sha256(bytes) });
 	}
 
@@ -497,6 +506,7 @@ function localExistingTarget(page: Page, rawDestination: string): string | null 
 
 for (const page of pages) {
 	const linkBody = withoutFencedCode(page.body);
+	if (/\.emf(?:[)#?\s]|$)/iu.test(linkBody)) addFailure('attachmentFormats', page.file, 'Markdown body still references an EMF attachment');
 	for (const image of markdownImages(linkBody)) {
 		const detail = imageLabelFailure(page, image);
 		if (detail) addFailure('imageLabels', page.file, detail);
